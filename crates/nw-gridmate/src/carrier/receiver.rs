@@ -64,11 +64,19 @@ impl Receiver {
     /// so callers must drain (`for msg in fed.messages() { … }`) or
     /// drop the value before feeding another datagram.
     pub fn feed(&mut self, data: Bytes) -> Result<FedDatagram<'_>, DecodeError> {
+        Ok(self.stage(decode_datagram(data)?))
+    }
+
+    /// Stage an already-decoded datagram. Split from [`Self::feed`] so
+    /// a caller with lifecycle work (duplicate-datagram rejection) can
+    /// run it between decode and staging: a frame staged here cannot
+    /// be taken back.
+    pub fn stage(&mut self, decoded: DecodedDatagram) -> FedDatagram<'_> {
         let DecodedDatagram {
             header,
             payload,
             frames,
-        } = decode_datagram(data)?;
+        } = decoded;
         for frame in frames {
             // Every frame — system or application — flows through
             // the reassembler so the iterator below has a single
@@ -78,11 +86,11 @@ impl Receiver {
             // `channel == SYSTEM_CHANNEL` after `messages()` yields.
             self.reassembler.accept(frame);
         }
-        Ok(FedDatagram {
+        FedDatagram {
             header,
             payload,
             receiver: self,
-        })
+        }
     }
 }
 

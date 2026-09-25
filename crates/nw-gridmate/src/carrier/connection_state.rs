@@ -20,6 +20,7 @@ use super::datagram_history::{
     DatagramHistoryList, apply_ack_data_to_send_queue, read_ack_data_frame,
     sequence_number_sequential_distance, write_ack_history,
 };
+use super::decoder::decode_datagram;
 use super::handshake_retry;
 use super::io::CarrierTransport;
 use super::message::{DataReliability, MessageData};
@@ -296,15 +297,14 @@ impl<T: CarrierTransport> ConnectionState<T> {
         // to acknowledge it).
         self.received_since_last_send = true;
 
-        // Hand the raw bytes to the pure decoder + per-channel
-        // reassembler. Lifecycle work (dedup, ACK history, time-since)
-        // happens around it; envelope parsing happens above it.
-        let fed = self
-            .receiver
-            .feed(data)
-            .map_err(|e| format!("decode datagram: {e}"))?;
+        // Decode first, stage later: the duplicate check below needs
+        // the header, and must run before any frame reaches the
+        // reassembler -- a staged frame cannot be taken back, so a
+        // repeated datagram would deliver its unreliable frames twice.
+        // Envelope parsing happens above this.
+        let decoded = decode_datagram(data).map_err(|e| format!("decode datagram: {e}"))?;
 
-        let header = fed.header;
+        let header = decoded.header;
         debug!(
             "Datagram header: seq={}, compressed={}",
             header.sequence_number.get(),
@@ -328,6 +328,7 @@ impl<T: CarrierTransport> ConnectionState<T> {
         {
             return Err("Duplicate datagram".to_string());
         }
+        let fed = self.receiver.stage(decoded);
 
         self.last_received_datagram_time = Instant::now();
 
@@ -982,5 +983,45 @@ mod tests {
             ack.data.as_ref(),
             &[0, 0, 0, 5, system_message::SM_CONNECT_ACK]
         );
+    }
+
+    /// A repeated datagram (same
+    /// datagram sequence number) must be rejected before its frames
+    /// reach the reassembler. Staging them first delivered a repeated
+    /// unreliable frame twice, and parked a channel behind a repeated
+    /// reliable one.
+    #[test]
+    fn a_duplicate_datagram_stages_none_of_its_frames() {
+        use crate::carrier::datagram::DatagramHeader;
+        use crate::carrier::message::MessageFlags;
+        use crate::session::CarrierChannel;
+
+        let channel = CarrierChannel::ReplicatedStateBundle;
+        let payload = b"input";
+        let mut bytes = vec![DatagramHeader::UNCOMPRESSED, 0];
+        bytes.extend_from_slice(&7u16.to_be_bytes());
+        bytes.push(MessageFlags::DataChannel as u8); // unreliable
+        bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        bytes.push(channel.id());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        let datagram = Bytes::from(bytes);
+
+        let mut conn = ConnectionState::new(NullTransport);
+        conn.process_incoming_datagram(datagram.clone()).expect("first copy");
+        assert_eq!(
+            conn.process_incoming_datagram(datagram).unwrap_err(),
+            "Duplicate datagram"
+        );
+        // A later datagram drains whatever the reassembler holds.
+        let empty = Bytes::from_static(&[DatagramHeader::UNCOMPRESSED, 0, 0, 8]);
+        conn.process_incoming_datagram(empty).expect("empty datagram");
+
+        let ch = channel.id() as usize;
+        let got: Vec<_> = std::iter::from_fn(|| conn.pop_ready_message(ch))
+            .map(|m| m.data.to_vec())
+            .collect();
+        assert_eq!(got, vec![payload.to_vec()], "delivered exactly once");
     }
 }
