@@ -81,14 +81,67 @@ impl Reassembler {
         }
     }
 
-    /// Push one frame into the staging queue for its channel. Frames
-    /// on channels `>= MAX_CHANNELS` are dropped (the production
-    /// receive path does the same — out-of-range channels are
-    /// malformed).
+    /// Stage one frame on its channel. Frames on channels
+    /// `>= MAX_CHANNELS` are dropped (the production receive path does
+    /// the same — out-of-range channels are malformed).
+    ///
+    /// Staging is kept in reliable-id order, not arrival order, since
+    /// the gate only ever looks at the head: a reliable frame that
+    /// arrives after its successors (a lost frame's resend, or plain
+    /// UDP reordering) must go in front of them, or the channel waits
+    /// on it for ever. A reliable frame whose id is already staged or
+    /// already delivered is a repeat and is dropped. An unreliable frame
+    /// goes right after the reliable frame it names as its predecessor,
+    /// behind any unreliable frame already there, which is the order it
+    /// was sent in.
     pub fn accept(&mut self, frame: MessageData) {
         let ch = frame.channel as usize;
-        if ch < MAX_CHANNELS {
-            self.staging[ch].push_back(frame);
+        if ch >= MAX_CHANNELS {
+            return;
+        }
+        let reliable = frame.reliability == DataReliability::Reliable;
+        let repeat = reliable
+            && (self.order_key(ch, &frame).is_none()
+                || self.staging[ch].iter().any(|m| {
+                    m.reliability == DataReliability::Reliable
+                        && m.send_reliable_seq_num == frame.send_reliable_seq_num
+                }));
+        if repeat {
+            debug!(
+                "[REASSEMBLE] channel={} discarded repeated reliable id {} ({} bytes)",
+                ch,
+                frame.send_reliable_seq_num.get(),
+                frame.data.len()
+            );
+            return;
+        }
+        let key = self.order_key(ch, &frame);
+        // ponytail: linear insert; staging holds a handful of frames.
+        let at = self.staging[ch]
+            .iter()
+            .position(|m| self.order_key(ch, m) > key)
+            .unwrap_or(self.staging[ch].len());
+        self.staging[ch].insert(at, frame);
+    }
+
+    /// Where a frame sorts in its channel's staging queue: how far its
+    /// reliable id (its own, or the predecessor an unreliable frame
+    /// names) is ahead of the last delivered one, then reliable before
+    /// unreliable. An unreliable frame free to go now sorts first.
+    /// `None` for a reliable frame that has already been delivered.
+    fn order_key(&self, ch: usize, m: &MessageData) -> Option<(u16, bool)> {
+        let last_rel = self.received_reliable_seq_num[ch];
+        let delivered_any = self.reliable_delivered[ch];
+        let id = m.send_reliable_seq_num;
+        let ahead = !delivered_any || seq_less_than(last_rel, id);
+        // From the sentinel on a fresh channel, so that keys stay
+        // consistent once the first reliable frame is delivered.
+        let dist = sequence_number_sequential_distance(last_rel, id);
+        match (m.reliability == DataReliability::Reliable, ahead) {
+            (true, true) => Some((dist, false)),
+            (true, false) => None,
+            (false, true) => Some((dist, true)),
+            (false, false) => Some((0, true)),
         }
     }
 
@@ -307,6 +360,16 @@ mod tests {
         r.drain().map(|(_, m)| m.data.to_vec()).collect()
     }
 
+    /// Deliver reliable ids 0 to `last` on channel 1, one at a time, as
+    /// a live link would: staging more than half the id space at once
+    /// has no order the wrapping comparison can give it.
+    fn deliver_up_to(r: &mut Reassembler, last: u16) {
+        for id in 0..=last {
+            r.accept(frame(1, true, 1, id, b"x"));
+            assert_eq!(delivered(r).len(), 1, "id {id}");
+        }
+    }
+
     /// The channel-death bug: a peer that retransmits a reliable
     /// frame does it in a *new* datagram, so the datagram-level dedup
     /// upstream passes it through. Before the fix the repeat parked the
@@ -328,13 +391,8 @@ mod tests {
 
     /// The control for the test above: the fix must not turn a *gap*
     /// into a discard. A reliable frame whose predecessor has not
-    /// arrived waits, as it always did, and is not counted as a repeat.
-    ///
-    /// It stops there deliberately. Staging is arrival-ordered and only
-    /// its head is examined, so a predecessor that arrives *later* is
-    /// queued behind the frame waiting for it and neither ever moves.
-    /// That is a second way this channel dies, beyond the retransmission
-    /// this patch fixes; a later commit fixes it.
+    /// arrived waits, as it always did, and is not discarded: when the
+    /// predecessor arrives *after* it, both deliver, in id order.
     #[test]
     fn a_reliable_gap_still_waits_for_what_is_missing() {
         let mut r = Reassembler::new();
@@ -342,7 +400,77 @@ mod tests {
         r.accept(frame(1, true, 3, 2, b"c"));
         assert_eq!(delivered(&mut r), vec![b"a".to_vec()], "c waits for b");
         assert!(delivered(&mut r).is_empty(), "and keeps waiting");
-        assert_eq!(r.staging[1].len(), 1, "a gap is not a repeat: c is kept");
+
+        r.accept(frame(1, true, 2, 1, b"b"));
+        assert_eq!(delivered(&mut r), vec![b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    /// A lost reliable frame is resent by the peer
+    /// after later frames have already arrived. Arrival-ordered staging
+    /// queued the resend behind the frames waiting for it and the
+    /// channel never moved again. An unreliable frame sent between r5
+    /// and r6 delivers between them, wherever it arrived.
+    #[test]
+    fn a_lost_reliable_frame_resent_behind_later_ones_delivers_in_order() {
+        let mut r = Reassembler::new();
+        for id in 0..=4 {
+            r.accept(frame(1, true, id, id, b"x"));
+        }
+        assert_eq!(delivered(&mut r).len(), 5);
+
+        r.accept(frame(1, true, 6, 6, b"r6"));
+        r.accept(frame(1, false, 7, 5, b"after r5"));
+        r.accept(frame(1, true, 8, 7, b"r7"));
+        assert!(delivered(&mut r).is_empty(), "all wait for r5");
+
+        r.accept(frame(1, true, 9, 5, b"r5"));
+        assert_eq!(
+            delivered(&mut r),
+            vec![
+                b"r5".to_vec(),
+                b"after r5".to_vec(),
+                b"r6".to_vec(),
+                b"r7".to_vec()
+            ]
+        );
+    }
+
+    /// A chunk run whose middle chunk is resent: once staged twice
+    /// (a copy arriving while the original is still staged), and once
+    /// lost and resent behind the chunk after it. Either way
+    /// `chunks_ready` used to see a broken run for good.
+    #[test]
+    fn a_resent_chunk_inside_a_run_does_not_break_the_run() {
+        let mut r = Reassembler::new();
+        r.accept(chunk(1, 1, 0, 3, b"he"));
+        r.accept(chunk(1, 2, 1, 1, b"l"));
+        r.accept(chunk(1, 3, 1, 1, b"l"));
+        r.accept(chunk(1, 4, 2, 1, b"lo"));
+        assert_eq!(delivered(&mut r), vec![b"hello".to_vec()]);
+
+        r.accept(chunk(1, 5, 3, 3, b"wo"));
+        r.accept(chunk(1, 7, 5, 1, b"ld"));
+        r.accept(chunk(1, 8, 4, 1, b"r"));
+        assert_eq!(delivered(&mut r), vec![b"world".to_vec()]);
+    }
+
+    /// Ordering reads the wrap the way the ids wrap: 0xFFFE, 0xFFFF,
+    /// 0, 1 arriving backwards still deliver forwards.
+    #[test]
+    fn a_reorder_across_the_wrap_delivers_in_id_order() {
+        let mut r = Reassembler::new();
+        deliver_up_to(&mut r, 0xfffd);
+
+        for (id, body) in [(1, b"1"), (0, b"0"), (0xffff, b"f"), (0xfffe, b"e")] {
+            r.accept(frame(1, true, 2, id, body));
+            if id != 0xfffe {
+                assert!(delivered(&mut r).is_empty());
+            }
+        }
+        assert_eq!(
+            delivered(&mut r),
+            vec![b"e".to_vec(), b"f".to_vec(), b"0".to_vec(), b"1".to_vec()]
+        );
     }
 
     /// An unreliable frame names the reliable id it was sent behind. A
@@ -368,13 +496,8 @@ mod tests {
     /// An unreliable frame whose reliable predecessor has *not* been
     /// delivered still waits: the control for the test above, so that
     /// "deliver what is behind us" cannot quietly become "deliver
-    /// everything".
-    ///
-    /// It only asserts the waiting. Whether the frame is ever released
-    /// once its predecessor arrives is a separate question this gate
-    /// does not answer: `Drain` looks at the head of the channel's
-    /// queue alone, so a predecessor that arrives *after* it is queued
-    /// behind it. A later commit fixes that.
+    /// everything". It is released once the predecessor arrives, even
+    /// though that arrives after it.
     #[test]
     fn an_unreliable_frame_waits_for_a_reliable_predecessor_that_is_missing() {
         let mut r = Reassembler::new();
@@ -382,7 +505,12 @@ mod tests {
         r.accept(frame(1, false, 2, 1, b"after r1"));
         assert_eq!(delivered(&mut r), vec![b"r0".to_vec()]);
         assert!(delivered(&mut r).is_empty(), "and it keeps waiting");
-        assert_eq!(r.staging[1].len(), 1, "and it is kept");
+
+        r.accept(frame(1, true, 3, 1, b"r1"));
+        assert_eq!(
+            delivered(&mut r),
+            vec![b"r1".to_vec(), b"after r1".to_vec()]
+        );
     }
 
     /// A retransmitted first chunk of a multi-chunk message blocks the
@@ -422,10 +550,7 @@ mod tests {
     #[test]
     fn a_resend_of_id_ffff_after_delivering_it_is_a_repeat() {
         let mut r = Reassembler::new();
-        for id in 0..=u16::MAX {
-            r.accept(frame(1, true, 1, id, b"x"));
-        }
-        assert_eq!(delivered(&mut r).len(), 65_536);
+        deliver_up_to(&mut r, u16::MAX);
 
         r.accept(frame(1, true, 2, 0xffff, b"resent"));
         r.accept(frame(1, true, 3, 0, b"past the wrap"));
@@ -441,10 +566,7 @@ mod tests {
         let mut r = Reassembler::new();
         // The gate's sentinel means a channel can only start at id 0,
         // so the wrap has to be walked up to.
-        for id in 0..=u16::MAX {
-            r.accept(frame(1, true, 1, id, b"x"));
-        }
-        assert_eq!(delivered(&mut r).len(), 65_536);
+        deliver_up_to(&mut r, u16::MAX);
 
         r.accept(frame(1, true, 2, 0, b"past the wrap"));
         assert_eq!(delivered(&mut r), vec![b"past the wrap".to_vec()]);
