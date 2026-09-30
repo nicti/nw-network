@@ -19,7 +19,7 @@
 //! - Lifecycle: established / data / disconnect events fan into a
 //!   single application-facing [`MultiPeerEvent`] channel.
 //! - Re-handshakes: a ClientHello from an established peer's address
-//!   starts a `Candidate` session beside it, which replaces the
+//!   starts a candidate session beside it, which replaces the
 //!   established one only when its handshake completes.
 //!
 //! The application drives the listener via [`MultiPeerListener::next_event`]
@@ -78,22 +78,47 @@ pub(crate) enum MultiPeerEvent {
 struct PeerHandle {
     inbound_tx: Sender<Bytes>,
     outbound_tx: Sender<Bytes>,
-    /// Set once `SSL_accept` completes. Also the entry's identity, so
-    /// a peer task only removes its own entry, never its successor's.
-    established: Arc<AtomicBool>,
+    session: Session,
+    /// The random of the ClientHello that started this session.
+    client_random: Vec<u8>,
 }
 
-/// A DTLS record carrying a ClientHello: handshake content type (22),
-/// epoch 0, handshake message type 1 (RFC 6347 §4.1, §4.2.2).
+/// One DTLS session's shared flags. Also its identity: a peer task
+/// only removes an entry holding its own `established`, never a
+/// successor's.
+#[derive(Clone)]
+struct Session {
+    /// Set once `SSL_accept` completes.
+    established: Arc<AtomicBool>,
+    /// Cleared, under the write lock, when a candidate replaces this
+    /// session. The task holds a read lock while it sends Data, so no
+    /// Data of the old session follows the replacement's Established.
+    live: Arc<async_lock::RwLock<bool>>,
+}
+
+impl Session {
+    fn is(&self, other: &Session) -> bool {
+        Arc::ptr_eq(&self.established, &other.established)
+    }
+}
+
+/// A DTLS record carrying the first fragment of a ClientHello:
+/// handshake content type (22), epoch 0, handshake message type 1,
+/// fragment_offset 0 (RFC 6347 §4.1, §4.2.2). Later fragments carry
+/// no random, so they must not count as a new hello.
 fn is_client_hello(datagram: &[u8]) -> bool {
-    datagram.len() > 13 && datagram[0] == 22 && datagram[3..5] == [0, 0] && datagram[13] == 1
+    datagram.len() >= 25
+        && datagram[0] == 22
+        && datagram[3..5] == [0, 0]
+        && datagram[13] == 1
+        && datagram[19..22] == [0, 0, 0]
 }
 
 /// The ClientHello's random, after the 13-byte record header, the
 /// 12-byte handshake header and the 2-byte client_version. A client
 /// keeps it for its retransmits and its cookie-bearing second hello.
-fn client_random(datagram: &[u8]) -> Option<&[u8]> {
-    datagram.get(27..59)
+fn client_random(datagram: &[u8]) -> Vec<u8> {
+    datagram.get(27..59).unwrap_or_default().to_vec()
 }
 
 /// Handshake (22) or ChangeCipherSpec (20) record. After its own
@@ -104,31 +129,39 @@ fn is_handshake(datagram: &[u8]) -> bool {
     matches!(datagram.first(), Some(20 | 22))
 }
 
-/// A handshake that has not finished by then is dropped: a new peer's
-/// entry goes away, a candidate is abandoned and the session it would
-/// have replaced is untouched.
-const HANDSHAKE_TIMEOUT: Duration = if cfg!(test) {
+/// How long a handshake may take before it is dropped. The listener
+/// never retransmits its own flights (no `DTLSv1_handle_timeout`); the
+/// client's retransmits drive it, so this is generous. A new peer's
+/// entry then goes away; a candidate is abandoned and the session it
+/// would have replaced is untouched.
+const PEER_HANDSHAKE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
+const CANDIDATE_HANDSHAKE_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(1)
 } else {
     Duration::from_secs(10)
 };
 
-/// A second DTLS session from an established peer's address, handshaking
-/// beside it. It replaces the established entry only once its
-/// `SSL_accept` completes, so a forged ClientHello cannot end a session.
-struct Candidate {
-    handle: PeerHandle,
-    client_random: Vec<u8>,
-}
+/// DTLS-level lifecycle events; aggregates across all peers so size
+/// for burst tolerance, not per-peer scale.
+const LISTENER_EVENT_CAPACITY: usize = 4096;
 
 /// The listener state the demux and the peer tasks share.
 #[derive(Clone)]
 struct Shared {
     peers: PeerMap,
-    candidates: Arc<DashMap<SocketAddr, Candidate>>,
+    /// A second DTLS session per established peer's address, at most
+    /// one, handshaking beside it. It replaces the established entry
+    /// only once its `SSL_accept` completes, so a forged ClientHello
+    /// cannot end a session.
+    candidates: PeerMap,
     /// Held while a peer entry leaves the map and its Disconnected (or a
-    /// replacement's Disconnected + Established) is sent, so the bridge
-    /// never sees a replacement's Established before the old peer's end.
+    /// replacement's Disconnected + Established, or a new peer's
+    /// Established) is sent, so the bridge never sees a replacement's
+    /// Established before the old peer's end.
     lifecycle: Arc<async_lock::Mutex<()>>,
 }
 
@@ -153,7 +186,7 @@ type PeerMap = Arc<DashMap<SocketAddr, PeerHandle>>;
 /// exits.
 pub struct MultiPeerListener {
     socket: Arc<Async<UdpSocket>>,
-    peers: PeerMap,
+    shared: Shared,
     event_rx: Receiver<MultiPeerEvent>,
     /// Held only for its Drop side-effect: closing the channel is the
     /// demux task's exit signal. See [`crate::spawn::ShutdownSignal`].
@@ -182,28 +215,25 @@ impl MultiPeerListener {
         let socket = Arc::new(Async::new(std_socket)?);
         let ssl_ctx = Arc::new(build_server_ssl_ctx(cert_pem, key_pem)?);
 
-        let peers: PeerMap = Arc::new(DashMap::new());
-        // DTLS-level lifecycle events; aggregates across all peers so
-        // size for burst tolerance, not per-peer scale.
-        const LISTENER_EVENT_CAPACITY: usize = 4096;
+        let shared = Shared {
+            peers: Arc::new(DashMap::new()),
+            candidates: Arc::new(DashMap::new()),
+            lifecycle: Arc::new(async_lock::Mutex::new(())),
+        };
         let (event_tx, event_rx) = bounded::<MultiPeerEvent>(LISTENER_EVENT_CAPACITY);
         let (shutdown, shutdown_rx) = crate::spawn::ShutdownSignal::new();
 
         crate::spawn::spawn_detached(demux_loop(
             socket.clone(),
             ssl_ctx,
-            Shared {
-                peers: peers.clone(),
-                candidates: Arc::new(DashMap::new()),
-                lifecycle: Arc::new(async_lock::Mutex::new(())),
-            },
+            shared.clone(),
             event_tx,
             shutdown_rx,
         ));
 
         Ok(Self {
             socket,
-            peers,
+            shared,
             event_rx,
             _shutdown: shutdown,
         })
@@ -237,7 +267,7 @@ impl MultiPeerListener {
         // Clone the sender out of the dashmap entry so we don't hold
         // the shard guard across the `.await`.
         let outbound_tx = {
-            let Some(handle) = self.peers.get(&peer_addr) else {
+            let Some(handle) = self.shared.peers.get(&peer_addr) else {
                 return Err(DriverError::Ssl(format!("unknown peer {peer_addr}")));
             };
             handle.outbound_tx.clone()
@@ -252,7 +282,7 @@ impl MultiPeerListener {
     /// unknown or its outbound queue is full. Used by the carrier
     /// driver task to push without spawning a forwarder.
     pub fn try_send_to(&self, peer_addr: SocketAddr, plaintext: Bytes) -> Result<(), DriverError> {
-        let Some(handle) = self.peers.get(&peer_addr) else {
+        let Some(handle) = self.shared.peers.get(&peer_addr) else {
             return Err(DriverError::Ssl(format!("unknown peer {peer_addr}")));
         };
         handle.outbound_tx.try_send(plaintext).map_err(|e| match e {
@@ -372,57 +402,76 @@ async fn demux_loop(
         // guards before `await` so we never hold a shard lock across
         // suspension.
         let hello = is_client_hello(&datagram);
-        let random = client_random(&datagram).unwrap_or_default().to_vec();
-        let peer = shared
-            .peers
-            .get(&peer_addr)
-            .map(|h| (h.inbound_tx.clone(), h.established.load(Ordering::Acquire)));
+        let random = if hello {
+            client_random(&datagram)
+        } else {
+            Vec::new()
+        };
+        let peer = shared.peers.get(&peer_addr).map(|h| {
+            (
+                h.inbound_tx.clone(),
+                h.session.established.load(Ordering::Acquire),
+                hello && h.client_random == random,
+            )
+        });
         let candidate = shared
             .candidates
             .get(&peer_addr)
-            .map(|c| (c.handle.inbound_tx.clone(), c.client_random == random));
+            .map(|c| (c.inbound_tx.clone(), hello && c.client_random == random));
+        let established = matches!(peer, Some((_, true, _)));
 
-        let established = matches!(peer, Some((_, true)));
-        if established && hello && !matches!(candidate, Some((_, true))) {
-            // A ClientHello on a finished handshake: a restarted client
-            // on the same address:port, or a forged datagram. The old
-            // SSL session would drop it, so handshake it in a candidate
-            // session beside the established one, which it replaces
-            // only if the handshake completes. A hello with another
-            // random replaces an unfinished candidate.
-            debug!(
-                ?peer_addr,
-                replacing_candidate = candidate.is_some(),
-                "demux: ClientHello on an established peer; starting a candidate DTLS session"
-            );
-            spawn_peer(
-                peer_addr,
-                datagram,
-                &ssl_ctx,
-                &socket,
-                &event_tx,
-                &shared,
-                Some(random),
-            );
+        // A hello with a random neither session here started with is a
+        // new handshake. Retransmits, a cookie-bearing second hello and
+        // late duplicates carry a known random and are routed below.
+        let known = matches!(peer, Some((_, _, true))) || matches!(candidate, Some((_, true)));
+        if hello && !known {
+            if established {
+                // A restarted client on the same address:port, or a
+                // forged datagram. The old SSL session would drop it, so
+                // handshake it in a candidate beside the established
+                // session, which it replaces only if the handshake
+                // completes. It replaces any unfinished candidate.
+                debug!(
+                    ?peer_addr,
+                    replacing_candidate = candidate.is_some(),
+                    "demux: ClientHello on an established peer; starting a candidate DTLS session"
+                );
+                spawn_peer(
+                    peer_addr, datagram, &ssl_ctx, &socket, &event_tx, &shared, true,
+                );
+            } else {
+                // No established session: this hello replaces whatever
+                // unfinished handshake the address had.
+                shared.candidates.remove(&peer_addr);
+                debug!(
+                    ?peer_addr,
+                    replacing_handshake = peer.is_some() || candidate.is_some(),
+                    "demux: new peer — spawning peer_task"
+                );
+                spawn_peer(
+                    peer_addr, datagram, &ssl_ctx, &socket, &event_tx, &shared, false,
+                );
+            }
             continue;
         }
         let inbound_tx = match (peer, candidate) {
-            // Handshake records go to the candidate, everything else to
-            // the established session.
-            (Some((tx, established)), Some((candidate_tx, _))) => {
-                if established && is_handshake(&datagram) {
+            // Handshake records go to the candidate, everything else
+            // (including a late duplicate of the established session's
+            // own hello) to the established session.
+            (Some((tx, established, own_hello)), Some((candidate_tx, _))) => {
+                if established && is_handshake(&datagram) && !own_hello {
                     candidate_tx
                 } else {
                     tx
                 }
             }
-            (Some((tx, _)), None) => tx,
+            (Some((tx, _, _)), None) => tx,
             // The established session ended while its candidate handshakes.
             (None, Some((candidate_tx, _))) => candidate_tx,
             (None, None) => {
-                debug!(?peer_addr, "demux: new peer — spawning peer_task");
-                spawn_peer(
-                    peer_addr, datagram, &ssl_ctx, &socket, &event_tx, &shared, None,
+                trace!(
+                    ?peer_addr,
+                    len, "demux: datagram from an unknown address; dropped"
                 );
                 continue;
             }
@@ -436,9 +485,8 @@ async fn demux_loop(
 }
 
 /// Registers a peer task for `peer_addr`, seeded with its ClientHello:
-/// as the address's peer, or as its candidate when `candidate_random`
-/// is set. A candidate replaces any unfinished one, whose task then
-/// sees its channels close.
+/// as the address's peer, or as its candidate. Either replaces the
+/// map's unfinished entry, whose task then sees its channels close.
 fn spawn_peer(
     peer_addr: SocketAddr,
     client_hello: Bytes,
@@ -446,35 +494,30 @@ fn spawn_peer(
     socket: &Arc<Async<UdpSocket>>,
     event_tx: &Sender<MultiPeerEvent>,
     shared: &Shared,
-    candidate_random: Option<Vec<u8>>,
+    is_candidate: bool,
 ) {
     // Bounded — slow consumer triggers `.send().await` backpressure
     // rather than unbounded memory growth.
     const PER_PEER_DTLS_QUEUE: usize = 256;
     let (inbound_tx, inbound_rx) = bounded::<Bytes>(PER_PEER_DTLS_QUEUE);
     let (outbound_tx, outbound_rx) = bounded::<Bytes>(PER_PEER_DTLS_QUEUE);
+    let client_random = client_random(&client_hello);
     // Cannot fail: the queue is new and empty.
     let _ = inbound_tx.try_send(client_hello);
-    let established = Arc::new(AtomicBool::new(false));
+    let session = Session {
+        established: Arc::new(AtomicBool::new(false)),
+        live: Arc::new(async_lock::RwLock::new(true)),
+    };
     let handle = PeerHandle {
         inbound_tx,
         outbound_tx,
-        established: established.clone(),
+        session: session.clone(),
+        client_random,
     };
-    let is_candidate = candidate_random.is_some();
-    match candidate_random {
-        Some(client_random) => {
-            shared.candidates.insert(
-                peer_addr,
-                Candidate {
-                    handle,
-                    client_random,
-                },
-            );
-        }
-        None => {
-            shared.peers.insert(peer_addr, handle);
-        }
+    if is_candidate {
+        shared.candidates.insert(peer_addr, handle);
+    } else {
+        shared.peers.insert(peer_addr, handle);
     }
     crate::spawn::spawn_detached(peer_task(
         peer_addr,
@@ -484,7 +527,7 @@ fn spawn_peer(
         outbound_rx,
         event_tx.clone(),
         shared.clone(),
-        established,
+        session,
         is_candidate,
     ));
 }
@@ -501,7 +544,7 @@ async fn peer_task(
     outbound_rx: Receiver<Bytes>,
     event_tx: Sender<MultiPeerEvent>,
     shared: Shared,
-    established: Arc<AtomicBool>,
+    session: Session,
     is_candidate: bool,
 ) {
     let result = run_peer(
@@ -512,10 +555,14 @@ async fn peer_task(
         &outbound_rx,
         &event_tx,
         &shared,
-        &established,
+        &session,
         is_candidate,
     )
     .await;
+    // Close our queues now: the demux and senders stop feeding us
+    // while we wait for `lifecycle` below.
+    drop(inbound_rx);
+    drop(outbound_rx);
     debug!(
         ?peer_addr,
         is_candidate,
@@ -523,13 +570,11 @@ async fn peer_task(
         "MultiPeerListener: peer task ended"
     );
 
-    // Entries are ours only while they hold our `established` flag.
-    let own = |h: &PeerHandle| Arc::ptr_eq(&h.established, &established);
     // A candidate that never completed ends silently: the session it
     // would have replaced is untouched.
     if shared
         .candidates
-        .remove_if(&peer_addr, |_, c| own(&c.handle))
+        .remove_if(&peer_addr, |_, c| c.session.is(&session))
         .is_some()
     {
         return;
@@ -538,7 +583,11 @@ async fn peer_task(
     // session -- but only our own: if a candidate replaced it, that
     // candidate has reported our end and the entry is its.
     let _lifecycle = shared.lifecycle.lock().await;
-    if shared.peers.remove_if(&peer_addr, |_, h| own(h)).is_none() {
+    if shared
+        .peers
+        .remove_if(&peer_addr, |_, h| h.session.is(&session))
+        .is_none()
+    {
         return;
     }
 
@@ -568,7 +617,7 @@ async fn run_peer(
     outbound_rx: &Receiver<Bytes>,
     event_tx: &Sender<MultiPeerEvent>,
     shared: &Shared,
-    established: &Arc<AtomicBool>,
+    session: &Session,
     is_candidate: bool,
 ) -> Result<(), String> {
     let mut ssl = Ssl::new(ssl_ctx).map_err(|e| format!("Ssl::new: {e}"))?;
@@ -581,13 +630,16 @@ async fn run_peer(
 
     // Drive SSL_accept until it returns 1, eating from inbound_rx
     // and flushing write_bio after each call.
+    let timeout = if is_candidate {
+        CANDIDATE_HANDSHAKE_TIMEOUT
+    } else {
+        PEER_HANDSHAKE_TIMEOUT
+    };
     let final_flight = futures_lite::future::or(
         accept_handshake(&ssl, read_bio, write_bio, peer_addr, socket, inbound_rx),
         async {
-            futures_timer::Delay::new(HANDSHAKE_TIMEOUT).await;
-            Err(format!(
-                "DTLS handshake not complete after {HANDSHAKE_TIMEOUT:?}"
-            ))
+            futures_timer::Delay::new(timeout).await;
+            Err(format!("DTLS handshake not complete after {timeout:?}"))
         },
     )
     .await?;
@@ -595,31 +647,35 @@ async fn run_peer(
 
     // Take the address before our last flight goes out, so the client's
     // first application data, which follows it, reaches this session.
-    if is_candidate {
+    {
         let _lifecycle = shared.lifecycle.lock().await;
-        let own = |c: &Candidate| Arc::ptr_eq(&c.handle.established, established);
-        let Some((_, candidate)) = shared.candidates.remove_if(&peer_addr, |_, c| own(c)) else {
-            // A newer ClientHello superseded this candidate.
-            return Ok(());
-        };
-        established.store(true, Ordering::Release);
-        if shared.peers.insert(peer_addr, candidate.handle).is_some() {
-            debug!(
-                ?peer_addr,
-                "MultiPeerListener: candidate DTLS session replaces the established one"
-            );
-            let _ = event_tx
-                .send(MultiPeerEvent::Disconnected {
-                    peer_addr,
-                    reason: "replaced by a new DTLS session from the same address".into(),
-                })
-                .await;
+        if is_candidate {
+            let Some((_, handle)) = shared
+                .candidates
+                .remove_if(&peer_addr, |_, c| c.session.is(session))
+            else {
+                // A newer ClientHello superseded this candidate.
+                return Ok(());
+            };
+            session.established.store(true, Ordering::Release);
+            if let Some(old) = shared.peers.insert(peer_addr, handle) {
+                // Waits out any Data the old session is sending, and
+                // stops it sending more.
+                *old.session.live.write().await = false;
+                debug!(
+                    ?peer_addr,
+                    "MultiPeerListener: candidate DTLS session replaces the established one"
+                );
+                let _ = event_tx
+                    .send(MultiPeerEvent::Disconnected {
+                        peer_addr,
+                        reason: "replaced by a new DTLS session from the same address".into(),
+                    })
+                    .await;
+            }
+        } else {
+            session.established.store(true, Ordering::Release);
         }
-        let _ = event_tx
-            .send(MultiPeerEvent::Established { peer_addr })
-            .await;
-    } else {
-        established.store(true, Ordering::Release);
         let _ = event_tx
             .send(MultiPeerEvent::Established { peer_addr })
             .await;
@@ -657,7 +713,7 @@ async fn run_peer(
         match event {
             Event::Inbound(Ok(datagram)) => {
                 bio_feed(read_bio, &datagram).map_err(|e| format!("bio_feed: {e}"))?;
-                drain_decrypted(&ssl, &mut recv_ring, peer_addr, event_tx).await?;
+                drain_decrypted(&ssl, &mut recv_ring, peer_addr, event_tx, &session.live).await?;
             }
             Event::Inbound(Err(_)) => return Ok(()),
             Event::Outbound(Ok(plaintext)) => {
@@ -752,6 +808,7 @@ async fn drain_decrypted(
     recv_ring: &mut super::recv_ring::RecvRing,
     peer_addr: SocketAddr,
     event_tx: &Sender<MultiPeerEvent>,
+    live: &async_lock::RwLock<bool>,
 ) -> Result<(), String> {
     loop {
         let n;
@@ -771,6 +828,10 @@ async fn drain_decrypted(
         };
         if n > 0 {
             trace!(?peer_addr, len = n, "MultiPeerListener: decrypted record");
+            let live = live.read().await;
+            if !*live {
+                return Err("replaced by a new DTLS session from the same address".into());
+            }
             if event_tx
                 .send(MultiPeerEvent::Data {
                     peer_addr,
@@ -910,7 +971,7 @@ mod tests {
         })
     }
 
-    const SETTLE: Duration = Duration::from_millis(300);
+    const SETTLE: Duration = Duration::from_millis(500);
 
     async fn next_data(listener: &MultiPeerListener) -> (SocketAddr, Bytes) {
         loop {
@@ -964,8 +1025,19 @@ mod tests {
         let hello = client_hello();
         assert!(is_client_hello(&hello));
         raw.send(&hello).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            listener.shared.candidates.len(),
+            1,
+            "a candidate is handshaking"
+        );
         // Past the candidate's handshake timeout (1 s in tests).
         let during = events_for(&listener, Duration::from_millis(1500));
+        assert_eq!(
+            listener.shared.candidates.len(),
+            0,
+            "the candidate timed out"
+        );
 
         client.write_all(b"after").unwrap();
         assert_eq!(during, Vec::<String>::new());
@@ -997,5 +1069,73 @@ mod tests {
                 "data new",
             ]
         );
+    }
+
+    #[test]
+    fn the_replaced_session_sends_no_data_after_the_new_one_is_established() {
+        let (listener, server) = listen();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let mut old = connect(socket, server).expect("first handshake");
+        // Fill the event queue, which this test is not reading yet, and
+        // leave more records in the old task's own queue: it is still
+        // draining them when the new session takes the address.
+        for i in 0..LISTENER_EVENT_CAPACITY + 200 {
+            old.write_all(b"old").unwrap();
+            if i % 50 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        std::thread::sleep(SETTLE);
+
+        let new_client = std::thread::spawn(move || {
+            let mut new = connect(same_port, server).expect("second handshake");
+            new.write_all(b"new").unwrap();
+        });
+        // The new session completes its handshake and waits to report
+        // itself behind the full event queue, as the old task does.
+        std::thread::sleep(SETTLE);
+        let events = events_for(&listener, Duration::from_secs(3));
+        new_client.join().unwrap();
+
+        let replaced = events
+            .iter()
+            .position(|e| e.starts_with("disconnected"))
+            .expect("the old session is reported replaced");
+        assert_eq!(
+            events[replaced],
+            "disconnected: replaced by a new DTLS session from the same address"
+        );
+        assert_eq!(
+            &events[replaced + 1..],
+            ["established", "data new"],
+            "{} old records before the replacement",
+            replaced - 1
+        );
+    }
+
+    #[test]
+    fn only_a_first_client_hello_fragment_counts_as_a_hello() {
+        // Record header (13): handshake, DTLS 1.2, epoch 0. Handshake
+        // header (12): ClientHello, fragment_offset 0. Then version and
+        // the 32-byte random.
+        let mut hello = vec![0u8; 60];
+        hello[0] = 22;
+        hello[1..3].copy_from_slice(&[0xfe, 0xfd]);
+        hello[13] = 1;
+        hello[27..59].fill(7);
+        assert!(is_client_hello(&hello));
+        assert_eq!(client_random(&hello), [7u8; 32]);
+
+        let mut later_fragment = hello.clone();
+        later_fragment[21] = 100;
+        assert!(!is_client_hello(&later_fragment));
+        let mut epoch_1 = hello.clone();
+        epoch_1[4] = 1;
+        assert!(!is_client_hello(&epoch_1));
+        let mut server_hello = hello.clone();
+        server_hello[13] = 2;
+        assert!(!is_client_hello(&server_hello));
+        assert!(!is_client_hello(&hello[..24]));
     }
 }
