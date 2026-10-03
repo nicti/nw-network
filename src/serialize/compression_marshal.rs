@@ -569,11 +569,12 @@ impl Float16Marshaler {
     /// Encode a bounded float as a clamped `u16` bucket.
     ///
     /// Values are normalized into `[0.0, 1.0]`, clamped, multiplied by
-    /// `u16::MAX`, and truncated toward the lower bucket. The truncation is
-    /// part of the bounded-range protocol shape.
+    /// `u16::MAX`, and rounded to the nearest bucket, so a decoded value is
+    /// within half a bucket of the input rather than up to a whole bucket
+    /// below it. The decoder is unchanged.
     pub fn marshal(&self, wb: &mut WriteBuffer, value: f32) {
         let normalized = ((value - self.min) / self.range).clamp(0.0, 1.0);
-        let q = f32_to_u16(normalized * f32::from(u16::MAX));
+        let q = f32_to_u16((normalized * f32::from(u16::MAX)).round());
         q.marshal(wb);
     }
 
@@ -1015,6 +1016,30 @@ impl<const MIN: i32, const MAX: i32> Codec<i32> for IntegerQuantizationMarshaler
 mod tests {
     use super::*;
     use crate::serialize::buffer::CARRIER_ENDIAN;
+
+    #[test]
+    fn float16_marshaler_rounds_to_the_nearest_bucket() {
+        let codec = Float16Marshaler::new(-100.0, 1000.0);
+        let half_bucket = 1100.0 / f32::from(u16::MAX) / 2.0;
+        let n = 5000;
+        let (mut sum, mut worst) = (0.0_f64, 0.0_f32);
+        for i in 0..n {
+            #[expect(clippy::cast_precision_loss, reason = "small test index")]
+            let value = 40.0 + 30.0 * (i as f32) / (n as f32);
+            let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+            codec.marshal(&mut wb, value);
+            let bytes = wb.into_vec();
+            let decoded = codec
+                .unmarshal(&mut ReadBuffer::new(CARRIER_ENDIAN, &bytes))
+                .unwrap();
+            let error = decoded - value;
+            sum += f64::from(error);
+            worst = worst.max(error.abs());
+        }
+        assert!(worst <= half_bucket + 1e-4, "worst {worst} > {half_bucket}");
+        let mean = sum / f64::from(n);
+        assert!(mean.abs() < f64::from(half_bucket) / 10.0, "mean {mean}");
+    }
 
     #[test]
     fn quat_smallest_three_quantized_roundtrip_wire_flags() {

@@ -24,7 +24,7 @@
 use crate::serialize::marshaler::{Marshal, Unmarshal};
 
 use super::{
-    buffer::{ReadBuffer, WriteBuffer},
+    buffer::{CARRIER_ENDIAN, ReadBuffer, WriteBuffer},
     error::MarshalerError,
     marshaler::{Codec, DefaultMarshaler},
     quantize::{f32_to_u8, f32_to_u32, u32_to_f32},
@@ -997,10 +997,48 @@ impl From<QuantizedRelativePosition> for [u8; 3] {
     }
 }
 
+/// Quantizes `value` in `[-delta_range, delta_range]` to the nearest of 256
+/// steps.
 #[must_use]
 pub fn quantize_with_range(value: f32, delta_range: f32) -> u8 {
     let quantized = (value + delta_range) * 255.0 / (2.0 * delta_range);
-    f32_to_u8(quantized.clamp(0.0, 255.0))
+    f32_to_u8(quantized.clamp(0.0, 255.0).round())
+}
+
+/// `value` as a decoder reads it back after codec `M` has written it.
+///
+/// A relative step must be taken from the anchor the receiver decodes, not
+/// from the sender's unquantized copy, or the anchor's own quantization
+/// error is added to every step.
+#[must_use]
+pub fn wire_round_trip<T: Copy, M: Codec<T>>(value: &T) -> T {
+    let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+    M::marshal(value, &mut wb);
+    let bytes = wb.into_vec();
+    let mut rb = ReadBuffer::new(CARRIER_ENDIAN, &bytes);
+    M::unmarshal(&mut rb).unwrap_or(*value)
+}
+
+/// The quantized step from `anchor` to `value` in `[-range, range]`, or
+/// `None` when the caller must re-anchor instead: a component is `range` or
+/// more away, or the rounded step would be the `[255, 255, 255]` no-step
+/// sentinel.
+#[must_use]
+pub fn quantize_relative_step(
+    anchor: Vec3,
+    value: Vec3,
+    range: f32,
+) -> Option<QuantizedRelativePosition> {
+    let diff = value - anchor;
+    if diff.x.abs() >= range || diff.y.abs() >= range || diff.z.abs() >= range {
+        return None;
+    }
+    let step = QuantizedRelativePosition::new([
+        quantize_with_range(diff.x, range),
+        quantize_with_range(diff.y, range),
+        quantize_with_range(diff.z, range),
+    ]);
+    (!step.is_zero()).then_some(step)
 }
 
 #[must_use]
@@ -1059,17 +1097,6 @@ impl<AbsoluteM: Codec<Vec3>> DynamicDeltaReplicatedFieldHandler<AbsoluteM> {
             .is_none_or(|v| v.is_zero())
     }
 
-    fn is_within_delta(&self, new_value: Vec3, quantization: f32) -> bool {
-        let abs = self.absolute_portion.value.unwrap_or(Vec3::ZERO);
-        let abs_diff = (abs - new_value).abs();
-        // Strict comparisons keep endpoint buckets free for the sentinel.
-        abs_diff.x < quantization && abs_diff.y < quantization && abs_diff.z < quantization
-    }
-
-    fn quantize(value: f32, quantization: f32) -> u8 {
-        quantize_with_range(value, quantization)
-    }
-
     fn unquantize(q: u8, quantization: f32) -> f32 {
         unquantize_with_range(q, quantization)
     }
@@ -1103,28 +1130,22 @@ impl<AbsoluteM: Codec<Vec3>> DynamicDeltaReplicatedFieldHandler<AbsoluteM> {
     }
 
     pub fn set_value(&mut self, new_value: Vec3, quantization: f32) {
-        let needs_anchor = !self.is_absolute_valid()
-            || self.quantization.value != Some(quantization)
-            || !self.is_within_delta(new_value, quantization);
-
-        if needs_anchor {
+        let step = self
+            .absolute_portion
+            .value
+            .filter(|_| self.is_absolute_valid() && self.quantization.value == Some(quantization))
+            .and_then(|abs| {
+                let decoded = wire_round_trip::<Vec3, AbsoluteM>(&abs);
+                quantize_relative_step(decoded, new_value, quantization)
+            });
+        let Some(step) = step else {
             self.absolute_portion.set_value(new_value);
             self.quantized_relative_portion
                 .set_value(QuantizedRelativePosition::default());
             self.quantization.set_value(quantization);
             return;
-        }
-
-        let abs = self.absolute_portion.value.unwrap_or(Vec3::ZERO);
-        let diff = new_value - abs;
-        let quantized = QuantizedRelativePosition {
-            quantized_values: [
-                Self::quantize(diff.x, quantization),
-                Self::quantize(diff.y, quantization),
-                Self::quantize(diff.z, quantization),
-            ],
         };
-        self.quantized_relative_portion.set_value(quantized);
+        self.quantized_relative_portion.set_value(step);
     }
 }
 
@@ -1244,6 +1265,33 @@ impl<const QUANTIZATION: u32, const ROLLOVER_THRESHOLD: u32>
 mod tests {
     use super::*;
     use crate::serialize::buffer::CARRIER_ENDIAN;
+
+    #[test]
+    fn quantize_with_range_rounds_to_the_nearest_step() {
+        let range = 2.0_f32;
+        let half_step = range / 255.0;
+        let n = 2000;
+        let (mut sum, mut worst) = (0.0_f32, 0.0_f32);
+        for i in 0..n {
+            #[expect(clippy::cast_precision_loss, reason = "small test index")]
+            let value = -0.99 * range + 1.98 * range * (i as f32) / (n as f32);
+            let error = unquantize_with_range(quantize_with_range(value, range), range) - value;
+            sum += error;
+            worst = worst.max(error.abs());
+        }
+        assert!(worst <= half_step + 1e-5, "worst {worst} > {half_step}");
+        #[expect(clippy::cast_precision_loss, reason = "small test count")]
+        let mean = sum / (n as f32);
+        assert!(mean.abs() < half_step / 10.0, "mean {mean}");
+    }
+
+    #[test]
+    fn a_step_that_rounds_to_the_no_step_sentinel_asks_for_a_new_anchor() {
+        let range = 2.0;
+        assert!(quantize_relative_step(Vec3::ZERO, Vec3::splat(1.999), range).is_none());
+        assert!(quantize_relative_step(Vec3::ZERO, Vec3::new(1.999, 0.0, 0.0), range).is_some());
+        assert!(quantize_relative_step(Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0), range).is_none());
+    }
 
     fn roundtrip_field<T, M>(value: T) -> T
     where
@@ -1441,13 +1489,15 @@ mod tests {
         assert_eq!(
             handler.quantized_relative_portion.value.unwrap(),
             QuantizedRelativePosition {
-                quantized_values: [63, 127, 191],
+                quantized_values: [64, 128, 191],
             }
         );
 
+        // Rounded to the nearest of the 256 steps: each within half a step
+        // (4/255 m) of the value set.
         let decoded = handler.value();
-        assert!((decoded.x - 7.976_470_5).abs() < 0.001, "{decoded:?}");
-        assert!((decoded.y - 19.984_314).abs() < 0.001, "{decoded:?}");
+        assert!((decoded.x - 8.007_843).abs() < 0.001, "{decoded:?}");
+        assert!((decoded.y - 20.015_686).abs() < 0.001, "{decoded:?}");
         assert!((decoded.z - 31.992_157).abs() < 0.001, "{decoded:?}");
     }
 }

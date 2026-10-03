@@ -26,7 +26,7 @@ use crate::serialize::{
     FloatTimerDeltaReplicatedField, HalfF32Marshaler, MarshalerError,
     PackedNormalizedVec3Marshaller, PackedPositionMarshaller, QuantizedRelativePosition,
     QuatSmallestThreeQuantized, ReadBuffer, ReplicatedFieldHandler, ReplicatedFieldHandlerBase,
-    VlqU32, WriteBuffer, quantize_with_range, unquantize_with_range,
+    VlqU32, WriteBuffer, quantize_relative_step, unquantize_with_range, wire_round_trip,
 };
 
 /// Maximum number of scoped action entries encoded by the action-list blobs.
@@ -102,39 +102,31 @@ impl AlcWorldPositionHandler {
         self.absolute_portion.is_field_valid()
     }
 
+    /// Sets the position: a step from the anchor when one fits, else a new
+    /// anchor. The step is taken from the anchor as the receiver decodes it
+    /// (its height is a 16-bit bucket) and rounded, so the decoded position
+    /// is within half a step of `value`.
     pub fn set_value(&mut self, value: Vec3, quantization: f32) {
-        let needs_anchor = !self.absolute_portion.is_field_valid()
-            || self.quantization.value().copied() != Some(quantization)
-            || !self.is_within_delta(value, quantization);
-
-        if needs_anchor {
+        let step = self
+            .absolute_portion
+            .value()
+            .copied()
+            .filter(|_| {
+                self.absolute_portion.is_field_valid()
+                    && self.quantization.value().copied() == Some(quantization)
+            })
+            .and_then(|anchor| {
+                let decoded = wire_round_trip::<Vec3, AlcPackedPositionMarshaller>(&anchor);
+                quantize_relative_step(decoded, value, quantization)
+            });
+        let Some(step) = step else {
             self.absolute_portion.set_value(value);
             self.quantized_relative_portion
                 .set_value(QuantizedRelativePosition::default());
             self.quantization.set_value(quantization);
             return;
-        }
-
-        let anchor = self.absolute_portion.value().copied().unwrap_or(Vec3::ZERO);
-        let diff = value - anchor;
-        self.quantized_relative_portion
-            .set_value(QuantizedRelativePosition::new([
-                Self::quantize_delta(diff.x, quantization),
-                Self::quantize_delta(diff.y, quantization),
-                Self::quantize_delta(diff.z, quantization),
-            ]));
-    }
-
-    fn is_within_delta(&self, value: Vec3, quantization: f32) -> bool {
-        let Some(anchor) = self.absolute_portion.value().copied() else {
-            return false;
         };
-        let abs_diff = (anchor - value).abs();
-        abs_diff.x < quantization && abs_diff.y < quantization && abs_diff.z < quantization
-    }
-
-    fn quantize_delta(value: f32, quantization: f32) -> u8 {
-        quantize_with_range(value, quantization)
+        self.quantized_relative_portion.set_value(step);
     }
 
     fn unquantize_delta(value: u8, quantization: f32) -> f32 {
@@ -778,6 +770,78 @@ impl Unmarshal for ALCReplicatedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The position as the receiver reads it: the anchor through its codec,
+    /// plus the decoded step.
+    fn as_received(handler: &AlcWorldPositionHandler) -> Vec3 {
+        let anchor = wire_round_trip::<Vec3, AlcPackedPositionMarshaller>(
+            handler.absolute_portion.value().unwrap(),
+        );
+        let step = handler
+            .quantized_relative_portion
+            .value()
+            .copied()
+            .unwrap_or_default();
+        if step.is_zero() {
+            return anchor;
+        }
+        let q = *handler.quantization.value().unwrap();
+        let [x, y, z] = step.quantized_values;
+        anchor
+            + Vec3::new(
+                unquantize_with_range(x, q),
+                unquantize_with_range(y, q),
+                unquantize_with_range(z, q),
+            )
+    }
+
+    #[test]
+    fn a_position_is_received_at_the_nearest_place_not_below_it() {
+        let q = 2.0;
+        let half_bucket = 1100.0 / f32::from(u16::MAX) / 2.0;
+        let half_step = q / 255.0;
+        let (mut anchored, mut stepped) = ((0.0_f64, 0.0_f32), (0.0_f64, 0.0_f32));
+        let n = 500;
+        for i in 0..n {
+            #[expect(clippy::cast_precision_loss, reason = "small test index")]
+            let t = i as f32 / n as f32;
+            let at = Vec3::new(8474.5 + 37.0 * t, 2919.5 - 11.0 * t, 55.0 + 9.7 * t);
+            let mut handler = AlcWorldPositionHandler::default();
+            handler.set_value(at, q);
+            let error = as_received(&handler).z - at.z;
+            anchored.0 += f64::from(error);
+            anchored.1 = anchored.1.max(error.abs());
+            let next = at + Vec3::new(0.31 * t, -0.27, 0.13 + 0.5 * t);
+            handler.set_value(next, q);
+            assert!(
+                !handler
+                    .quantized_relative_portion
+                    .value()
+                    .unwrap()
+                    .is_zero()
+            );
+            let error = as_received(&handler) - next;
+            stepped.0 += f64::from(error.z);
+            stepped.1 = stepped.1.max(error.abs().max_element());
+        }
+        assert!(
+            anchored.1 <= half_bucket + 1e-4,
+            "anchored worst {}",
+            anchored.1
+        );
+        assert!(stepped.1 <= half_step + 1e-4, "stepped worst {}", stepped.1);
+        let n = f64::from(n);
+        assert!(
+            (anchored.0 / n).abs() < 2e-3,
+            "anchored mean {}",
+            anchored.0 / n
+        );
+        assert!(
+            (stepped.0 / n).abs() < 2e-3,
+            "stepped mean {}",
+            stepped.0 / n
+        );
+    }
 
     #[test]
     fn alc_world_position_reports_handler_validity() {

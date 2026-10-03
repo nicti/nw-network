@@ -64,7 +64,8 @@ pub use replicated_field::{
     DeltaCompressedCounterHandler, DeltaCompressedReplicatedFieldHandler, DeltaIntegerMarshaler,
     DeltaMarshaler, DynamicDeltaReplicatedFieldHandler, FloatTimerDeltaReplicatedField,
     HalfF32Marshaler, HalfVec3Marshaler, IntegerOmitLowerByteMarshaler, QuantizedRelativePosition,
-    ReplicatedFieldHandler, ReplicatedFieldHandlerBase, quantize_with_range, unquantize_with_range,
+    ReplicatedFieldHandler, ReplicatedFieldHandlerBase, quantize_relative_step,
+    quantize_with_range, unquantize_with_range, wire_round_trip,
 };
 pub use utility_marshal::{BitSet, HalfF32, RawSequenceNumber};
 pub use vlq::{VlqU16, VlqU16Marshaler, VlqU32, VlqU32Marshaler, VlqU64, VlqU64Marshaler};
