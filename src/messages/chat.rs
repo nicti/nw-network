@@ -2,7 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::generated_messages::ChatComponentClientFacetReceiveBatchedChatMessages;
+    use crate::generated_messages::{
+        ChatComponentClientFacetReceiveBatchedChatMessages,
+        ChatComponentClientFacetReceiveLocalizedSystemChatMessage,
+    };
     use crate::serialize::{CARRIER_ENDIAN, Marshal, ReadBuffer, Unmarshal, WriteBuffer};
 
     /// A request id, then made-up values throughout.
@@ -57,5 +60,19 @@ mod tests {
         assert_reads_whole_and_roundtrips::<ChatComponentClientFacetReceiveBatchedChatMessages>(
             &body,
         );
+    }
+
+    #[test]
+    fn localized_system_chat_message_reads_its_parameters() {
+        let mut body = HEADER.to_vec();
+        body.extend(chat_message("three"));
+        body.push(2);
+        body.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        string(&mut body, "epsilon");
+        body.extend_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+        string(&mut body, "zeta");
+        assert_reads_whole_and_roundtrips::<
+            ChatComponentClientFacetReceiveLocalizedSystemChatMessage,
+        >(&body);
     }
 }

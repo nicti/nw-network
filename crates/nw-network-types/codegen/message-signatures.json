@@ -779,6 +779,27 @@
           "wireShape": "vec<composite<string,string,u8,string,u32,string,string,bool,bool,bool,bool,bool,fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>,u32,string,bool,u8>>"
         }
       ]
+    },
+    {
+      "typeId": "BDBC5D31-9836-4999-A7E5-117C5DC8B807",
+      "typeIndex": 1886,
+      "name": "Javelin::ClientMessages::ChatComponentClientFacet_ReceiveLocalizedSystemChatMessage",
+      "rustName": "ChatComponentClientFacetReceiveLocalizedSystemChatMessage",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Header",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "Message",
+          "wireShape": "composite<composite<string,string,u8,string,u32,string,string,bool,bool,bool,bool,bool,fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>,u32,string,bool,u8>,vec<composite<u32,string>>>"
+        }
+      ]
     }
   ]
 }
