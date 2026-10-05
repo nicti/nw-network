@@ -758,6 +758,27 @@
           "wireShape": "u8"
         }
       ]
+    },
+    {
+      "typeId": "533A61D2-87DF-4BD9-B904-D2F8455426FA",
+      "typeIndex": 293,
+      "name": "Javelin::ClientMessages::ChatComponentClientFacet_ReceiveBatchedChatMessages",
+      "rustName": "ChatComponentClientFacetReceiveBatchedChatMessages",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Header",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "Messages",
+          "wireShape": "vec<composite<string,string,u8,string,u32,string,string,bool,bool,bool,bool,bool,fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>,u32,string,bool,u8>>"
+        }
+      ]
     }
   ]
 }

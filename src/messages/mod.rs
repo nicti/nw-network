@@ -1,6 +1,8 @@
 //! Concrete network message payloads.
 
 pub mod actor_mover;
+#[cfg(test)]
+mod chat;
 pub mod registration;
 #[cfg(test)]
 mod server_context;
