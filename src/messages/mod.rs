@@ -3,6 +3,8 @@
 pub mod actor_mover;
 #[cfg(test)]
 mod chat;
+#[cfg(test)]
+mod objectives;
 pub mod registration;
 #[cfg(test)]
 mod server_context;

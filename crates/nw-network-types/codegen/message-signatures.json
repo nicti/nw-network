@@ -800,6 +800,27 @@
           "wireShape": "composite<composite<string,string,u8,string,u32,string,string,bool,bool,bool,bool,bool,fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>,u32,string,bool,u8>,vec<composite<u32,string>>>"
         }
       ]
+    },
+    {
+      "typeId": "298436A9-06D0-4BDA-8DD9-0708B36E7374",
+      "typeIndex": 1458,
+      "name": "Javelin::ClientMessages::ObjectivesComponentServerFacet_UpdateTrackedObjectives",
+      "rustName": "ObjectivesComponentServerFacetUpdateTrackedObjectives",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Header",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "TrackedObjectives",
+          "wireShape": "fixed-vector<u64,8>"
+        }
+      ]
     }
   ]
 }
