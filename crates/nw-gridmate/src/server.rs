@@ -391,15 +391,14 @@ async fn event_bridge_loop(
                 peer_addr,
                 outbound,
             } => {
-                let (inbound_tx, outbound_tx) = spawn_peer_carrier(
+                let (inbound_tx, session) = spawn_peer_carrier(
                     peer_addr,
-                    outbound.clone(),
+                    outbound,
                     event_tx.clone(),
                     peers.clone(),
                     protocol,
                 );
                 peer_inbound.insert(peer_addr, inbound_tx);
-                let session = peers.register(peer_addr, outbound_tx, outbound);
                 tracing::info!(?peer_addr, ?session, "[GRIDMATE-IN] peer connected");
                 if event_tx.send(Event::Ready { session }).await.is_err() {
                     return;
@@ -438,10 +437,11 @@ async fn event_bridge_loop(
     }
 }
 
-/// Spawn the per-peer carrier driver for a peer that just finished
-/// the DTLS handshake. Returns the inbound queue (for
+/// Register and spawn the per-peer carrier driver for a peer that just
+/// finished the DTLS handshake. Returns the inbound queue (for
 /// `event_bridge_loop` to forward decrypted bytes into) and the
-/// outbound queue (for the application to push commands into).
+/// session's id. The driver only ever ends its own session: by the time
+/// it fails, the address may belong to a newer one (#439).
 ///
 /// The carrier's outbound plaintext goes directly into `dtls`, the
 /// SSL_write queue of the DTLS session it was made for — no per-peer
@@ -453,7 +453,7 @@ fn spawn_peer_carrier(
     event_tx: Sender<Event>,
     peers: Arc<PeerRegistry>,
     protocol: CarrierProtocolProfile,
-) -> (Sender<Bytes>, Sender<OutboundTyped>) {
+) -> (Sender<Bytes>, SessionId) {
     // Per-peer queues. Bounded so a stalled consumer surfaces
     // backpressure via `.send().await` rather than growing memory
     // unbounded. 256 datagrams × MTU ≈ 300 KB per peer is the
@@ -461,6 +461,7 @@ fn spawn_peer_carrier(
     const PER_PEER_QUEUE_CAPACITY: usize = 256;
     let (inbound_tx, inbound_rx) = bounded::<Bytes>(PER_PEER_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = bounded::<OutboundTyped>(PER_PEER_QUEUE_CAPACITY);
+    let session = peers.register(peer_addr, cmd_tx, dtls.clone());
 
     // Carrier driver: handshake then steady-state loop.
     let event_tx_for_driver = event_tx.clone();
@@ -482,8 +483,7 @@ fn spawn_peer_carrier(
             Ok(c) => c,
             Err(err) => {
                 warn!(?peer_addr, ?err, "carrier ready failed");
-                let session = peers_for_driver.remove(peer_addr);
-                if let Some(session) = session {
+                if peers_for_driver.remove_session(session).is_some() {
                     let _ = event_tx_for_driver
                         .send(Event::Disconnected {
                             session,
@@ -497,6 +497,7 @@ fn spawn_peer_carrier(
 
         run_peer_session(
             peer_addr,
+            session,
             &mut connected,
             &cmd_rx,
             &event_tx_for_driver,
@@ -505,7 +506,7 @@ fn spawn_peer_carrier(
         .await;
     });
 
-    (inbound_tx, cmd_tx)
+    (inbound_tx, session)
 }
 
 /// Per-peer steady-state loop. Selects on the carrier's inbound
@@ -514,6 +515,7 @@ fn spawn_peer_carrier(
 /// the application.
 async fn run_peer_session(
     peer_addr: SocketAddr,
+    session: SessionId,
     connected: &mut CarrierImpl<crate::carrier::Connected>,
     cmd_rx: &Receiver<OutboundTyped>,
     event_tx: &Sender<Event>,
@@ -528,13 +530,12 @@ async fn run_peer_session(
 
         match action {
             Action::Inbound(Some(msg)) => {
-                if !handle_inbound(peer_addr, msg, event_tx, peers).await {
+                if !handle_inbound(peer_addr, session, msg, event_tx, peers).await {
                     return;
                 }
             }
             Action::Inbound(None) => {
-                let session = peers.remove(peer_addr);
-                if let Some(session) = session {
+                if peers.remove_session(session).is_some() {
                     let _ = event_tx
                         .send(Event::Disconnected {
                             session,
@@ -557,8 +558,7 @@ async fn run_peer_session(
                     .await
                 {
                     warn!(?peer_addr, ?err, "carrier send failed; dropping peer");
-                    let session = peers.remove(peer_addr);
-                    if let Some(session) = session {
+                    if peers.remove_session(session).is_some() {
                         let _ = event_tx
                             .send(Event::Disconnected {
                                 session,
@@ -572,7 +572,7 @@ async fn run_peer_session(
                 // session_id; if the peer disappeared while we held the
                 // outbound cmd, skip the event (the disconnect path
                 // will have already fired).
-                if let Some(session) = peers.session_for(peer_addr) {
+                if peers.peer_addr_for(session).is_some() {
                     let type_index = parse_outbound_type_index(&envelope);
                     let _ = event_tx
                         .send(Event::Sent {
@@ -599,13 +599,14 @@ enum Action {
 /// Returns `false` to signal the run loop should exit.
 async fn handle_inbound(
     peer_addr: SocketAddr,
+    session: SessionId,
     msg: CarrierEvent,
     event_tx: &Sender<Event>,
     peers: &Arc<PeerRegistry>,
 ) -> bool {
-    let Some(session) = peers.session_for(peer_addr) else {
+    if peers.peer_addr_for(session).is_none() {
         return true;
-    };
+    }
     match msg {
         CarrierEvent::MessageReceived { channel, data } => {
             // System / out-of-range channels are carrier control —

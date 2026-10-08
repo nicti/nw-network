@@ -1212,6 +1212,52 @@ mod tests {
         assert_eq!(events_for(&listener, SETTLE), ["established"]);
     }
 
+    /// #439, one layer up: after `disconnect`, the same port connects as
+    /// a new session, and the old session's carrier, failing once its
+    /// DTLS session is gone, does not end the new one.
+    #[test]
+    fn a_disconnected_sessions_port_connects_as_a_new_session() {
+        use crate::session_service::Event;
+        let _ = crate::spawn::set_spawner(Arc::new(ThreadSpawner));
+        let (cert, key) = crate::driver::test_cert::generate_self_signed_cert("localhost").unwrap();
+        let handle = async_io::block_on(crate::server::ServerListenerHandle::bind(
+            "127.0.0.1:0",
+            &cert,
+            &key,
+        ))
+        .unwrap();
+        let server = handle.local_addr();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(Event::Ready { session: old }) = async_io::block_on(handle.next_event()) else {
+            panic!("the first session is ready");
+        };
+        assert!(handle.disconnect(old));
+        assert!(!handle.disconnect(old), "already gone");
+
+        let _new = connect(same_port, server).expect("second handshake");
+        let events = async_io::block_on(async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut out = Vec::new();
+            while let Some(event) = futures_lite::future::or(handle.next_event(), async {
+                async_io::Timer::at(deadline).await;
+                None
+            })
+            .await
+            {
+                out.push(match event {
+                    Event::Ready { session } => format!("ready {}", session != old),
+                    Event::Disconnected { reason, .. } => format!("disconnected: {reason}"),
+                    other => format!("{other:?}"),
+                });
+            }
+            out
+        });
+        assert_eq!(events, ["ready true"]);
+        assert_eq!(handle.peer_count(), 1);
+    }
+
     #[test]
     fn only_a_first_client_hello_fragment_counts_as_a_hello() {
         // Record header (13): handshake, DTLS 1.2, epoch 0. Handshake
