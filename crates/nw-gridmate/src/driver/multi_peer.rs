@@ -56,7 +56,12 @@ const SSL_ERROR_WANT_WRITE: i32 = 3;
 #[derive(Debug, Clone)]
 pub(crate) enum MultiPeerEvent {
     /// A peer's `SSL_accept` returned 1 — DTLS handshake complete.
-    Established { peer_addr: SocketAddr },
+    /// `outbound` is this session's own plaintext queue: writes through
+    /// it can never reach a later session on the same address (#439).
+    Established {
+        peer_addr: SocketAddr,
+        outbound: Sender<Bytes>,
+    },
     /// Plaintext bytes from a peer (one DTLS application record per
     /// event, modulo SSL coalescing).
     Data {
@@ -276,6 +281,18 @@ impl MultiPeerListener {
             .send(plaintext)
             .await
             .map_err(|e| DriverError::Ssl(format!("peer {peer_addr} closed: {e}")))
+    }
+
+    /// Drops the DTLS session whose plaintext queue is `outbound` (the
+    /// one its `Established` carried), if it still holds `peer_addr`.
+    /// Its task ends and no Disconnected follows: the caller ended it.
+    /// A later ClientHello from that address is then a new peer, not a
+    /// replacement (#439). Nothing goes to the peer.
+    pub(crate) fn close_peer(&self, peer_addr: SocketAddr, outbound: &Sender<Bytes>) -> bool {
+        self.shared
+            .peers
+            .remove_if(&peer_addr, |_, h| h.outbound_tx.same_channel(outbound))
+            .is_some()
     }
 
     /// Sync, non-blocking variant. Returns `Err` if the peer is
@@ -658,6 +675,7 @@ async fn run_peer(
                 return Ok(());
             };
             session.established.store(true, Ordering::Release);
+            let outbound = handle.outbound_tx.clone();
             if let Some(old) = shared.peers.insert(peer_addr, handle) {
                 // Waits out any Data the old session is sending, and
                 // stops it sending more.
@@ -673,12 +691,26 @@ async fn run_peer(
                     })
                     .await;
             }
+            let _ = event_tx
+                .send(MultiPeerEvent::Established {
+                    peer_addr,
+                    outbound,
+                })
+                .await;
         } else {
             session.established.store(true, Ordering::Release);
+            let outbound = match shared.peers.get(&peer_addr) {
+                Some(h) if h.session.is(session) => h.outbound_tx.clone(),
+                // A newer ClientHello replaced this unfinished peer.
+                _ => return Ok(()),
+            };
+            let _ = event_tx
+                .send(MultiPeerEvent::Established {
+                    peer_addr,
+                    outbound,
+                })
+                .await;
         }
-        let _ = event_tx
-            .send(MultiPeerEvent::Established { peer_addr })
-            .await;
     }
     if !final_flight.is_empty() {
         socket
@@ -1112,6 +1144,72 @@ mod tests {
             "{} old records before the replacement",
             replaced - 1
         );
+    }
+
+    /// #439: the replaced session's carrier keeps writing for a moment
+    /// (its resends, and the SM_DISCONNECT its drop sends). Those writes
+    /// must not reach the client that now holds the address.
+    #[test]
+    fn a_replaced_sessions_carrier_cannot_write_to_the_new_session() {
+        use crate::carrier::io::{CarrierTransport, ChannelTransport};
+        let (listener, server) = listen();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(MultiPeerEvent::Established { outbound, .. }) =
+            async_io::block_on(listener.next_event())
+        else {
+            panic!("the first session is established");
+        };
+        // What the bridge hands the old session's carrier.
+        let (_inbound_tx, inbound) = bounded::<Bytes>(1);
+        let mut old_carrier = ChannelTransport {
+            peer_addr: local,
+            inbound,
+            outbound,
+        };
+
+        let mut new = connect(same_port, server).expect("second handshake");
+        assert_eq!(
+            events_for(&listener, SETTLE),
+            [
+                "disconnected: replaced by a new DTLS session from the same address",
+                "established",
+            ]
+        );
+        let _ = async_io::block_on(old_carrier.write(Bytes::from_static(b"stale")));
+        async_io::block_on(listener.send_to(local, Bytes::from_static(b"fresh"))).unwrap();
+        let mut buf = [0u8; 64];
+        let n = new.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"fresh");
+    }
+
+    /// #439: a session the server closed leaves nothing behind, so the
+    /// next client on its address:port is a new peer, not a replacement.
+    #[test]
+    fn after_close_peer_the_same_port_connects_as_a_new_peer() {
+        let (listener, server) = listen();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(MultiPeerEvent::Established { outbound, .. }) =
+            async_io::block_on(listener.next_event())
+        else {
+            panic!("the first session is established");
+        };
+
+        let (other, _) = bounded::<Bytes>(1);
+        assert!(
+            !listener.close_peer(local, &other),
+            "another session's queue closes nothing"
+        );
+        assert!(listener.close_peer(local, &outbound));
+        assert!(!listener.close_peer(local, &outbound), "already closed");
+
+        let _new = connect(same_port, server).expect("second handshake");
+        assert_eq!(events_for(&listener, SETTLE), ["established"]);
     }
 
     #[test]

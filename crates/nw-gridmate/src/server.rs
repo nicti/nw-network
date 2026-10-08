@@ -78,6 +78,8 @@ pub struct ServerListenerHandle {
 
 struct ServerListenerInner {
     local_addr: SocketAddr,
+    /// For [`ServerListenerHandle::disconnect`].
+    listener: Arc<MultiPeerListener>,
     event_rx: Receiver<Event>,
     peers: Arc<PeerRegistry>,
     /// Bridge-task exit signal. The bridge captures
@@ -112,10 +114,21 @@ impl PeerRegistry {
         }
     }
 
-    fn register(&self, peer_addr: SocketAddr, outbound: Sender<OutboundTyped>) -> SessionId {
+    fn register(
+        &self,
+        peer_addr: SocketAddr,
+        outbound: Sender<OutboundTyped>,
+        dtls: Sender<Bytes>,
+    ) -> SessionId {
         let session = SessionId::new(self.next_session.fetch_add(1, Ordering::Relaxed));
-        self.by_addr
-            .insert(peer_addr, PeerEntry { session, outbound });
+        self.by_addr.insert(
+            peer_addr,
+            PeerEntry {
+                session,
+                outbound,
+                dtls,
+            },
+        );
         self.by_session.insert(session, peer_addr);
         session
     }
@@ -124,6 +137,16 @@ impl PeerRegistry {
         let (_, entry) = self.by_addr.remove(&peer_addr)?;
         self.by_session.remove(&entry.session);
         Some(entry.session)
+    }
+
+    /// Removes `session`, and only it: its address may already belong
+    /// to a newer session.
+    fn remove_session(&self, session: SessionId) -> Option<(SocketAddr, PeerEntry)> {
+        let (_, peer_addr) = self.by_session.remove(&session)?;
+        let (_, entry) = self
+            .by_addr
+            .remove_if(&peer_addr, |_, e| e.session == session)?;
+        Some((peer_addr, entry))
     }
 
     fn outbound_for(&self, session: SessionId) -> Option<Sender<OutboundTyped>> {
@@ -147,6 +170,9 @@ impl PeerRegistry {
 struct PeerEntry {
     session: SessionId,
     outbound: Sender<OutboundTyped>,
+    /// The DTLS session's plaintext queue: which session this is, to
+    /// the listener.
+    dtls: Sender<Bytes>,
 }
 
 impl ServerListenerHandle {
@@ -184,6 +210,7 @@ impl ServerListenerHandle {
         Ok(Self {
             inner: Arc::new(ServerListenerInner {
                 local_addr,
+                listener,
                 event_rx,
                 peers,
                 _bridge_shutdown: bridge_shutdown,
@@ -229,6 +256,21 @@ impl ServerListenerHandle {
     /// [`Self::session_for`]. Lock-free.
     pub fn peer_addr_for(&self, session: SessionId) -> Option<SocketAddr> {
         self.inner.peers.peer_addr_for(session)
+    }
+
+    /// Ends `session` from the server's side: its carrier stops and its
+    /// DTLS session is dropped, so a later connect from the same address
+    /// is a new peer rather than a replacement of this one (#439).
+    /// Nothing is sent to the peer, and no [`Event::Disconnected`]
+    /// follows. `false` when the session is already gone.
+    pub fn disconnect(&self, session: SessionId) -> bool {
+        let Some((peer_addr, entry)) = self.inner.peers.remove_session(session) else {
+            return false;
+        };
+        self.inner.listener.close_peer(peer_addr, &entry.dtls);
+        // Dropping `entry` closes the carrier's command queue, which
+        // ends its task.
+        true
     }
 
     /// Number of currently-connected peers. Lock-free.
@@ -345,16 +387,19 @@ async fn event_bridge_loop(
             }
         };
         match event {
-            MultiPeerEvent::Established { peer_addr } => {
+            MultiPeerEvent::Established {
+                peer_addr,
+                outbound,
+            } => {
                 let (inbound_tx, outbound_tx) = spawn_peer_carrier(
                     peer_addr,
-                    listener.clone(),
+                    outbound.clone(),
                     event_tx.clone(),
                     peers.clone(),
                     protocol,
                 );
                 peer_inbound.insert(peer_addr, inbound_tx);
-                let session = peers.register(peer_addr, outbound_tx);
+                let session = peers.register(peer_addr, outbound_tx, outbound);
                 tracing::info!(?peer_addr, ?session, "[GRIDMATE-IN] peer connected");
                 if event_tx.send(Event::Ready { session }).await.is_err() {
                     return;
@@ -398,12 +443,13 @@ async fn event_bridge_loop(
 /// `event_bridge_loop` to forward decrypted bytes into) and the
 /// outbound queue (for the application to push commands into).
 ///
-/// The carrier's outbound plaintext goes directly into the listener's
-/// per-peer SSL_write queue via the `ChannelTransport`'s listener
-/// reference — no per-peer forwarder task.
+/// The carrier's outbound plaintext goes directly into `dtls`, the
+/// SSL_write queue of the DTLS session it was made for — no per-peer
+/// forwarder task, and nothing it writes can reach a later session on
+/// the same address (#439).
 fn spawn_peer_carrier(
     peer_addr: SocketAddr,
-    listener: Arc<MultiPeerListener>,
+    dtls: Sender<Bytes>,
     event_tx: Sender<Event>,
     peers: Arc<PeerRegistry>,
     protocol: CarrierProtocolProfile,
@@ -419,12 +465,11 @@ fn spawn_peer_carrier(
     // Carrier driver: handshake then steady-state loop.
     let event_tx_for_driver = event_tx.clone();
     let peers_for_driver = peers.clone();
-    let listener_for_driver = listener.clone();
     crate::spawn::spawn_detached(async move {
         let io = ChannelTransport {
             peer_addr,
             inbound: inbound_rx,
-            listener: listener_for_driver,
+            outbound: dtls,
         };
         let carrier = match CarrierImpl::accept_with_protocol_profile(io, protocol) {
             Ok(c) => c,
