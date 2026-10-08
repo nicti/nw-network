@@ -287,7 +287,9 @@ impl MultiPeerListener {
     /// one its `Established` carried), if it still holds `peer_addr`.
     /// Its task ends and no Disconnected follows: the caller ended it.
     /// A later ClientHello from that address is then a new peer, not a
-    /// replacement (#439). Nothing goes to the peer.
+    /// replacement (#439). No alert or close is sent; writes already
+    /// queued, or made before the task drops the queue, still go out
+    /// under this session's keys.
     pub(crate) fn close_peer(&self, peer_addr: SocketAddr, outbound: &Sender<Bytes>) -> bool {
         self.shared
             .peers
@@ -1256,6 +1258,40 @@ mod tests {
         });
         assert_eq!(events, ["ready true"]);
         assert_eq!(handle.peer_count(), 1);
+    }
+
+    /// #439: `disconnect` closes the session's carrier inbound at once
+    /// (the bridge used to keep a sender per address, with whatever was
+    /// queued in it), and the carrier task ends, even one that has not
+    /// finished its carrier handshake.
+    #[test]
+    fn disconnect_before_the_carrier_connects_ends_its_task() {
+        use crate::session_service::Event;
+        let _ = crate::spawn::set_spawner(Arc::new(ThreadSpawner));
+        let (cert, key) = crate::driver::test_cert::generate_self_signed_cert("localhost").unwrap();
+        let handle = async_io::block_on(crate::server::ServerListenerHandle::bind(
+            "127.0.0.1:0",
+            &cert,
+            &key,
+        ))
+        .unwrap();
+        let idle = handle.event_senders();
+        // DTLS only: the carrier stays in `ready()`.
+        let _client = connect(UdpSocket::bind("127.0.0.1:0").unwrap(), handle.local_addr())
+            .expect("handshake");
+        let Some(Event::Ready { session }) = async_io::block_on(handle.next_event()) else {
+            panic!("the session is ready");
+        };
+        assert_eq!(handle.event_senders(), idle + 1, "one carrier task");
+        assert!(!handle.inbound_closed(session));
+        assert!(handle.disconnect(session));
+        assert!(handle.inbound_closed(session), "no sender lingers");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while handle.event_senders() > idle && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handle.event_senders(), idle, "the carrier task ended");
     }
 
     #[test]
