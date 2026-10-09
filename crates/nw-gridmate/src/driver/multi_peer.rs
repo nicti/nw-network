@@ -56,7 +56,12 @@ const SSL_ERROR_WANT_WRITE: i32 = 3;
 #[derive(Debug, Clone)]
 pub(crate) enum MultiPeerEvent {
     /// A peer's `SSL_accept` returned 1 — DTLS handshake complete.
-    Established { peer_addr: SocketAddr },
+    /// `outbound` is this session's own plaintext queue: writes through
+    /// it can never reach a later session on the same address (#439).
+    Established {
+        peer_addr: SocketAddr,
+        outbound: Sender<Bytes>,
+    },
     /// Plaintext bytes from a peer (one DTLS application record per
     /// event, modulo SSL coalescing).
     Data {
@@ -276,6 +281,20 @@ impl MultiPeerListener {
             .send(plaintext)
             .await
             .map_err(|e| DriverError::Ssl(format!("peer {peer_addr} closed: {e}")))
+    }
+
+    /// Drops the DTLS session whose plaintext queue is `outbound` (the
+    /// one its `Established` carried), if it still holds `peer_addr`.
+    /// Its task ends and no Disconnected follows: the caller ended it.
+    /// A later ClientHello from that address is then a new peer, not a
+    /// replacement (#439). No alert or close is sent; writes already
+    /// queued, or made before the task drops the queue, still go out
+    /// under this session's keys.
+    pub(crate) fn close_peer(&self, peer_addr: SocketAddr, outbound: &Sender<Bytes>) -> bool {
+        self.shared
+            .peers
+            .remove_if(&peer_addr, |_, h| h.outbound_tx.same_channel(outbound))
+            .is_some()
     }
 
     /// Sync, non-blocking variant. Returns `Err` if the peer is
@@ -658,6 +677,7 @@ async fn run_peer(
                 return Ok(());
             };
             session.established.store(true, Ordering::Release);
+            let outbound = handle.outbound_tx.clone();
             if let Some(old) = shared.peers.insert(peer_addr, handle) {
                 // Waits out any Data the old session is sending, and
                 // stops it sending more.
@@ -673,12 +693,26 @@ async fn run_peer(
                     })
                     .await;
             }
+            let _ = event_tx
+                .send(MultiPeerEvent::Established {
+                    peer_addr,
+                    outbound,
+                })
+                .await;
         } else {
             session.established.store(true, Ordering::Release);
+            let outbound = match shared.peers.get(&peer_addr) {
+                Some(h) if h.session.is(session) => h.outbound_tx.clone(),
+                // A newer ClientHello replaced this unfinished peer.
+                _ => return Ok(()),
+            };
+            let _ = event_tx
+                .send(MultiPeerEvent::Established {
+                    peer_addr,
+                    outbound,
+                })
+                .await;
         }
-        let _ = event_tx
-            .send(MultiPeerEvent::Established { peer_addr })
-            .await;
     }
     if !final_flight.is_empty() {
         socket
@@ -1112,6 +1146,152 @@ mod tests {
             "{} old records before the replacement",
             replaced - 1
         );
+    }
+
+    /// #439: the replaced session's carrier keeps writing for a moment
+    /// (its resends, and the SM_DISCONNECT its drop sends). Those writes
+    /// must not reach the client that now holds the address.
+    #[test]
+    fn a_replaced_sessions_carrier_cannot_write_to_the_new_session() {
+        use crate::carrier::io::{CarrierTransport, ChannelTransport};
+        let (listener, server) = listen();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(MultiPeerEvent::Established { outbound, .. }) =
+            async_io::block_on(listener.next_event())
+        else {
+            panic!("the first session is established");
+        };
+        // What the bridge hands the old session's carrier.
+        let (_inbound_tx, inbound) = bounded::<Bytes>(1);
+        let mut old_carrier = ChannelTransport {
+            peer_addr: local,
+            inbound,
+            outbound,
+        };
+
+        let mut new = connect(same_port, server).expect("second handshake");
+        assert_eq!(
+            events_for(&listener, SETTLE),
+            [
+                "disconnected: replaced by a new DTLS session from the same address",
+                "established",
+            ]
+        );
+        let _ = async_io::block_on(old_carrier.write(Bytes::from_static(b"stale")));
+        async_io::block_on(listener.send_to(local, Bytes::from_static(b"fresh"))).unwrap();
+        let mut buf = [0u8; 64];
+        let n = new.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"fresh");
+    }
+
+    /// #439: a session the server closed leaves nothing behind, so the
+    /// next client on its address:port is a new peer, not a replacement.
+    #[test]
+    fn after_close_peer_the_same_port_connects_as_a_new_peer() {
+        let (listener, server) = listen();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(MultiPeerEvent::Established { outbound, .. }) =
+            async_io::block_on(listener.next_event())
+        else {
+            panic!("the first session is established");
+        };
+
+        let (other, _) = bounded::<Bytes>(1);
+        assert!(
+            !listener.close_peer(local, &other),
+            "another session's queue closes nothing"
+        );
+        assert!(listener.close_peer(local, &outbound));
+        assert!(!listener.close_peer(local, &outbound), "already closed");
+
+        let _new = connect(same_port, server).expect("second handshake");
+        assert_eq!(events_for(&listener, SETTLE), ["established"]);
+    }
+
+    /// #439, one layer up: after `disconnect`, the same port connects as
+    /// a new session, and the old session's carrier, failing once its
+    /// DTLS session is gone, does not end the new one.
+    #[test]
+    fn a_disconnected_sessions_port_connects_as_a_new_session() {
+        use crate::session_service::Event;
+        let _ = crate::spawn::set_spawner(Arc::new(ThreadSpawner));
+        let (cert, key) = crate::driver::test_cert::generate_self_signed_cert("localhost").unwrap();
+        let handle = async_io::block_on(crate::server::ServerListenerHandle::bind(
+            "127.0.0.1:0",
+            &cert,
+            &key,
+        ))
+        .unwrap();
+        let server = handle.local_addr();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let same_port = socket.try_clone().unwrap();
+        let _old = connect(socket, server).expect("first handshake");
+        let Some(Event::Ready { session: old }) = async_io::block_on(handle.next_event()) else {
+            panic!("the first session is ready");
+        };
+        assert!(handle.disconnect(old));
+        assert!(!handle.disconnect(old), "already gone");
+
+        let _new = connect(same_port, server).expect("second handshake");
+        let events = async_io::block_on(async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut out = Vec::new();
+            while let Some(event) = futures_lite::future::or(handle.next_event(), async {
+                async_io::Timer::at(deadline).await;
+                None
+            })
+            .await
+            {
+                out.push(match event {
+                    Event::Ready { session } => format!("ready {}", session != old),
+                    Event::Disconnected { reason, .. } => format!("disconnected: {reason}"),
+                    other => format!("{other:?}"),
+                });
+            }
+            out
+        });
+        assert_eq!(events, ["ready true"]);
+        assert_eq!(handle.peer_count(), 1);
+    }
+
+    /// #439: `disconnect` closes the session's carrier inbound at once
+    /// (the bridge used to keep a sender per address, with whatever was
+    /// queued in it), and the carrier task ends, even one that has not
+    /// finished its carrier handshake.
+    #[test]
+    fn disconnect_before_the_carrier_connects_ends_its_task() {
+        use crate::session_service::Event;
+        let _ = crate::spawn::set_spawner(Arc::new(ThreadSpawner));
+        let (cert, key) = crate::driver::test_cert::generate_self_signed_cert("localhost").unwrap();
+        let handle = async_io::block_on(crate::server::ServerListenerHandle::bind(
+            "127.0.0.1:0",
+            &cert,
+            &key,
+        ))
+        .unwrap();
+        let idle = handle.event_senders();
+        // DTLS only: the carrier stays in `ready()`.
+        let _client = connect(UdpSocket::bind("127.0.0.1:0").unwrap(), handle.local_addr())
+            .expect("handshake");
+        let Some(Event::Ready { session }) = async_io::block_on(handle.next_event()) else {
+            panic!("the session is ready");
+        };
+        assert_eq!(handle.event_senders(), idle + 1, "one carrier task");
+        assert!(!handle.inbound_closed(session));
+        assert!(handle.disconnect(session));
+        assert!(handle.inbound_closed(session), "no sender lingers");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while handle.event_senders() > idle && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handle.event_senders(), idle, "the carrier task ended");
     }
 
     #[test]

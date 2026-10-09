@@ -5,7 +5,7 @@
 //! `read`s and `write`s bytes. Our port collapses driver +
 //! connection into [`SecureConnection`] for the initiator
 //! (one DTLS socket per outbound peer) and routes through a shared
-//! [`MultiPeerListener`] for the responder (multi-peer demux on one
+//! [`crate::driver::MultiPeerListener`] for the responder (multi-peer demux on one
 //! shared socket).
 //!
 //! [`CarrierTransport`] is the seam. Both impls live alongside this
@@ -14,17 +14,13 @@
 //! `read`/`write`/`try_recv` is monomorphised against the concrete
 //! transport, no `dyn` dispatch and no per-call match arms.
 
-#[cfg(feature = "server")]
-use crate::driver::MultiPeerListener;
 use crate::driver::error::DriverError;
 use crate::driver::{Established, SecureConnection};
 #[cfg(feature = "server")]
-use async_channel::{Receiver, TryRecvError};
+use async_channel::{Receiver, Sender, TryRecvError};
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
-#[cfg(feature = "server")]
-use std::sync::Arc;
 
 /// Per-peer byte transport feeding one [`super::connection_state::ConnectionState`].
 ///
@@ -90,15 +86,27 @@ impl CarrierTransport for DtlsTransport {
 }
 
 /// Responder-side transport: plaintext arrives via `inbound` (fed by
-/// [`MultiPeerListener`]'s demux loop) and outbound carrier datagrams
-/// go directly into the listener's per-peer SSL_write queue via
-/// `listener.send_to(peer_addr, ...)`. One task per peer is
-/// eliminated by skipping any intermediate forwarder hop.
+/// [`crate::driver::MultiPeerListener`]'s demux loop) and outbound carrier datagrams
+/// go straight into the per-peer SSL_write queue of the one DTLS
+/// session this carrier was made for.
+///
+/// That queue, not the peer's address: a client restarted on the same
+/// address:port replaces the DTLS session, and an address lookup would
+/// then hand this carrier's last writes (its resends, the SM_DISCONNECT
+/// its drop sends) to the new client, which fails its connect (#439).
+/// Once its session is replaced or closed, a write still goes out under
+/// the OLD session's keys until that session's task drops the queue (the
+/// new client discards those as bad MAC); after that, writes fail.
+///
+/// A closed `inbound` means the session is gone (the server registry
+/// held its only sender), so `read` reports a non-retryable error: the
+/// driver stops instead of spinning, and a carrier still in `ready()`
+/// gets its `Error`.
 #[cfg(feature = "server")]
 pub struct ChannelTransport {
     pub peer_addr: SocketAddr,
     pub inbound: Receiver<Bytes>,
-    pub listener: Arc<MultiPeerListener>,
+    pub outbound: Sender<Bytes>,
 }
 
 #[cfg(feature = "server")]
@@ -108,23 +116,52 @@ impl CarrierTransport for ChannelTransport {
     }
 
     async fn read(&mut self) -> Result<Bytes, DriverError> {
-        self.inbound
-            .recv()
-            .await
-            .map_err(|_| DriverError::ConnectionClosed)
+        self.inbound.recv().await.map_err(|_| self.session_closed())
     }
 
     fn try_recv(&mut self) -> Result<Option<Bytes>, DriverError> {
         match self.inbound.try_recv() {
             Ok(bytes) => Ok(Some(bytes)),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Closed) => Err(DriverError::ConnectionClosed),
+            Err(TryRecvError::Closed) => Err(self.session_closed()),
         }
     }
 
     async fn write(&mut self, data: Bytes) -> Result<usize, DriverError> {
         let len = data.len();
-        self.listener.send_to(self.peer_addr, data).await?;
+        self.outbound
+            .send(data)
+            .await
+            .map_err(|_| self.session_closed())?;
         Ok(len)
+    }
+}
+
+#[cfg(feature = "server")]
+impl ChannelTransport {
+    /// Not `ConnectionClosed`: that one is retryable.
+    fn session_closed(&self) -> DriverError {
+        DriverError::Ssl(format!("peer {} DTLS session closed", self.peer_addr))
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    /// A closed inbound must stop the driver, not read as retryable:
+    /// a retryable error would leave it spinning.
+    #[test]
+    fn a_closed_inbound_is_not_retryable() {
+        let (inbound_tx, inbound) = async_channel::bounded::<Bytes>(1);
+        let (outbound, _outbound_rx) = async_channel::bounded::<Bytes>(1);
+        let mut io = ChannelTransport {
+            peer_addr: "127.0.0.1:1".parse().unwrap(),
+            inbound,
+            outbound,
+        };
+        drop(inbound_tx);
+        assert!(!io.try_recv().unwrap_err().is_retryable());
+        assert!(!async_io::block_on(io.read()).unwrap_err().is_retryable());
     }
 }

@@ -43,7 +43,6 @@ use crate::session_service::{Event, OutboundSink, Outgoing, SessionId};
 use async_channel::{Receiver, Sender, bounded};
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,6 +77,8 @@ pub struct ServerListenerHandle {
 
 struct ServerListenerInner {
     local_addr: SocketAddr,
+    /// For [`ServerListenerHandle::disconnect`].
+    listener: Arc<MultiPeerListener>,
     event_rx: Receiver<Event>,
     peers: Arc<PeerRegistry>,
     /// Bridge-task exit signal. The bridge captures
@@ -101,6 +102,10 @@ struct PeerRegistry {
     by_addr: DashMap<SocketAddr, PeerEntry>,
     by_session: DashMap<SessionId, SocketAddr>,
     next_session: AtomicUsize,
+    /// A receiver of each session's inbound, to see it close. A
+    /// receiver keeps no sender alive.
+    #[cfg(test)]
+    inbound_probes: DashMap<SessionId, Receiver<Bytes>>,
 }
 
 impl PeerRegistry {
@@ -109,13 +114,28 @@ impl PeerRegistry {
             by_addr: DashMap::new(),
             by_session: DashMap::new(),
             next_session: AtomicUsize::new(0),
+            #[cfg(test)]
+            inbound_probes: DashMap::new(),
         }
     }
 
-    fn register(&self, peer_addr: SocketAddr, outbound: Sender<OutboundTyped>) -> SessionId {
+    fn register(
+        &self,
+        peer_addr: SocketAddr,
+        outbound: Sender<OutboundTyped>,
+        inbound: Sender<Bytes>,
+        dtls: Sender<Bytes>,
+    ) -> SessionId {
         let session = SessionId::new(self.next_session.fetch_add(1, Ordering::Relaxed));
-        self.by_addr
-            .insert(peer_addr, PeerEntry { session, outbound });
+        self.by_addr.insert(
+            peer_addr,
+            PeerEntry {
+                session,
+                outbound,
+                inbound,
+                dtls,
+            },
+        );
         self.by_session.insert(session, peer_addr);
         session
     }
@@ -126,9 +146,23 @@ impl PeerRegistry {
         Some(entry.session)
     }
 
+    /// Removes `session`, and only it: its address may already belong
+    /// to a newer session.
+    fn remove_session(&self, session: SessionId) -> Option<(SocketAddr, PeerEntry)> {
+        let (_, peer_addr) = self.by_session.remove(&session)?;
+        let (_, entry) = self
+            .by_addr
+            .remove_if(&peer_addr, |_, e| e.session == session)?;
+        Some((peer_addr, entry))
+    }
+
     fn outbound_for(&self, session: SessionId) -> Option<Sender<OutboundTyped>> {
         let peer_addr = *self.by_session.get(&session)?;
         self.by_addr.get(&peer_addr).map(|e| e.outbound.clone())
+    }
+
+    fn inbound_for(&self, peer_addr: SocketAddr) -> Option<Sender<Bytes>> {
+        self.by_addr.get(&peer_addr).map(|e| e.inbound.clone())
     }
 
     fn session_for(&self, peer_addr: SocketAddr) -> Option<SessionId> {
@@ -147,6 +181,13 @@ impl PeerRegistry {
 struct PeerEntry {
     session: SessionId,
     outbound: Sender<OutboundTyped>,
+    /// Decrypted datagrams into the carrier. The entry holds the only
+    /// sender, so removing the session closes the carrier's inbound and
+    /// its driver ends, even one still in `ready()`.
+    inbound: Sender<Bytes>,
+    /// The DTLS session's plaintext queue: which session this is, to
+    /// the listener.
+    dtls: Sender<Bytes>,
 }
 
 impl ServerListenerHandle {
@@ -184,6 +225,7 @@ impl ServerListenerHandle {
         Ok(Self {
             inner: Arc::new(ServerListenerInner {
                 local_addr,
+                listener,
                 event_rx,
                 peers,
                 _bridge_shutdown: bridge_shutdown,
@@ -229,6 +271,42 @@ impl ServerListenerHandle {
     /// [`Self::session_for`]. Lock-free.
     pub fn peer_addr_for(&self, session: SessionId) -> Option<SocketAddr> {
         self.inner.peers.peer_addr_for(session)
+    }
+
+    /// Ends `session` from the server's side: its carrier stops and its
+    /// DTLS session is dropped, so a later connect from the same address
+    /// is a new peer rather than a replacement of this one (#439).
+    /// No disconnect is sent on purpose, though the carrier's last writes
+    /// may still go out under this session's keys until its DTLS task
+    /// ends; no [`Event::Disconnected`] follows. Works at any point after
+    /// [`Event::Ready`], also before the carrier handshake completes.
+    /// `false` when the session is already gone.
+    pub fn disconnect(&self, session: SessionId) -> bool {
+        let Some((peer_addr, entry)) = self.inner.peers.remove_session(session) else {
+            return false;
+        };
+        self.inner.listener.close_peer(peer_addr, &entry.dtls);
+        // Dropping `entry` closes the carrier's command and inbound
+        // queues, which ends its task.
+        true
+    }
+
+    /// Whether every sender of `session`'s carrier inbound is gone.
+    #[cfg(test)]
+    pub(crate) fn inbound_closed(&self, session: SessionId) -> bool {
+        self.inner
+            .peers
+            .inbound_probes
+            .get(&session)
+            .unwrap()
+            .is_closed()
+    }
+
+    /// Senders of the event queue: the bridge's plus one per live
+    /// carrier task.
+    #[cfg(test)]
+    pub(crate) fn event_senders(&self) -> usize {
+        self.inner.event_rx.sender_count()
     }
 
     /// Number of currently-connected peers. Lock-free.
@@ -320,9 +398,6 @@ async fn event_bridge_loop(
     protocol: CarrierProtocolProfile,
     shutdown_rx: Receiver<()>,
 ) {
-    // Per-peer plaintext sender (demux → carrier).
-    let mut peer_inbound: HashMap<SocketAddr, Sender<Bytes>> = HashMap::new();
-
     loop {
         enum BridgeStep {
             Event(Option<crate::driver::MultiPeerEvent>),
@@ -345,16 +420,17 @@ async fn event_bridge_loop(
             }
         };
         match event {
-            MultiPeerEvent::Established { peer_addr } => {
-                let (inbound_tx, outbound_tx) = spawn_peer_carrier(
+            MultiPeerEvent::Established {
+                peer_addr,
+                outbound,
+            } => {
+                let session = spawn_peer_carrier(
                     peer_addr,
-                    listener.clone(),
+                    outbound,
                     event_tx.clone(),
                     peers.clone(),
                     protocol,
                 );
-                peer_inbound.insert(peer_addr, inbound_tx);
-                let session = peers.register(peer_addr, outbound_tx);
                 tracing::info!(?peer_addr, ?session, "[GRIDMATE-IN] peer connected");
                 if event_tx.send(Event::Ready { session }).await.is_err() {
                     return;
@@ -364,14 +440,13 @@ async fn event_bridge_loop(
                 peer_addr,
                 plaintext,
             } => {
-                if let Some(tx) = peer_inbound.get(&peer_addr)
-                    && tx.send(plaintext).await.is_err()
-                {
-                    peer_inbound.remove(&peer_addr);
+                // A closed inbound means the carrier ended; its session
+                // is removed on that path.
+                if let Some(tx) = peers.inbound_for(peer_addr) {
+                    let _ = tx.send(plaintext).await;
                 }
             }
             MultiPeerEvent::Disconnected { peer_addr, reason } => {
-                peer_inbound.remove(&peer_addr);
                 let session = peers.remove(peer_addr);
                 if let Some(session) = session {
                     tracing::info!(?peer_addr, ?session, %reason, "[GRIDMATE-IN] peer disconnected");
@@ -393,21 +468,23 @@ async fn event_bridge_loop(
     }
 }
 
-/// Spawn the per-peer carrier driver for a peer that just finished
-/// the DTLS handshake. Returns the inbound queue (for
-/// `event_bridge_loop` to forward decrypted bytes into) and the
-/// outbound queue (for the application to push commands into).
+/// Register and spawn the per-peer carrier driver for a peer that just
+/// finished the DTLS handshake. Returns the session's id; its inbound
+/// queue (for `event_bridge_loop` to forward decrypted bytes into)
+/// lives in the session's registry entry. The driver only ever ends its own session: by the time
+/// it fails, the address may belong to a newer one (#439).
 ///
-/// The carrier's outbound plaintext goes directly into the listener's
-/// per-peer SSL_write queue via the `ChannelTransport`'s listener
-/// reference — no per-peer forwarder task.
+/// The carrier's outbound plaintext goes directly into `dtls`, the
+/// SSL_write queue of the DTLS session it was made for — no per-peer
+/// forwarder task, and nothing it writes can reach a later session on
+/// the same address (#439).
 fn spawn_peer_carrier(
     peer_addr: SocketAddr,
-    listener: Arc<MultiPeerListener>,
+    dtls: Sender<Bytes>,
     event_tx: Sender<Event>,
     peers: Arc<PeerRegistry>,
     protocol: CarrierProtocolProfile,
-) -> (Sender<Bytes>, Sender<OutboundTyped>) {
+) -> SessionId {
     // Per-peer queues. Bounded so a stalled consumer surfaces
     // backpressure via `.send().await` rather than growing memory
     // unbounded. 256 datagrams × MTU ≈ 300 KB per peer is the
@@ -415,16 +492,18 @@ fn spawn_peer_carrier(
     const PER_PEER_QUEUE_CAPACITY: usize = 256;
     let (inbound_tx, inbound_rx) = bounded::<Bytes>(PER_PEER_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = bounded::<OutboundTyped>(PER_PEER_QUEUE_CAPACITY);
+    let session = peers.register(peer_addr, cmd_tx, inbound_tx, dtls.clone());
+    #[cfg(test)]
+    peers.inbound_probes.insert(session, inbound_rx.clone());
 
     // Carrier driver: handshake then steady-state loop.
     let event_tx_for_driver = event_tx.clone();
     let peers_for_driver = peers.clone();
-    let listener_for_driver = listener.clone();
     crate::spawn::spawn_detached(async move {
         let io = ChannelTransport {
             peer_addr,
             inbound: inbound_rx,
-            listener: listener_for_driver,
+            outbound: dtls,
         };
         let carrier = match CarrierImpl::accept_with_protocol_profile(io, protocol) {
             Ok(c) => c,
@@ -437,8 +516,7 @@ fn spawn_peer_carrier(
             Ok(c) => c,
             Err(err) => {
                 warn!(?peer_addr, ?err, "carrier ready failed");
-                let session = peers_for_driver.remove(peer_addr);
-                if let Some(session) = session {
+                if peers_for_driver.remove_session(session).is_some() {
                     let _ = event_tx_for_driver
                         .send(Event::Disconnected {
                             session,
@@ -452,6 +530,7 @@ fn spawn_peer_carrier(
 
         run_peer_session(
             peer_addr,
+            session,
             &mut connected,
             &cmd_rx,
             &event_tx_for_driver,
@@ -460,7 +539,7 @@ fn spawn_peer_carrier(
         .await;
     });
 
-    (inbound_tx, cmd_tx)
+    session
 }
 
 /// Per-peer steady-state loop. Selects on the carrier's inbound
@@ -469,6 +548,7 @@ fn spawn_peer_carrier(
 /// the application.
 async fn run_peer_session(
     peer_addr: SocketAddr,
+    session: SessionId,
     connected: &mut CarrierImpl<crate::carrier::Connected>,
     cmd_rx: &Receiver<OutboundTyped>,
     event_tx: &Sender<Event>,
@@ -483,13 +563,12 @@ async fn run_peer_session(
 
         match action {
             Action::Inbound(Some(msg)) => {
-                if !handle_inbound(peer_addr, msg, event_tx, peers).await {
+                if !handle_inbound(peer_addr, session, msg, event_tx, peers).await {
                     return;
                 }
             }
             Action::Inbound(None) => {
-                let session = peers.remove(peer_addr);
-                if let Some(session) = session {
+                if peers.remove_session(session).is_some() {
                     let _ = event_tx
                         .send(Event::Disconnected {
                             session,
@@ -512,8 +591,7 @@ async fn run_peer_session(
                     .await
                 {
                     warn!(?peer_addr, ?err, "carrier send failed; dropping peer");
-                    let session = peers.remove(peer_addr);
-                    if let Some(session) = session {
+                    if peers.remove_session(session).is_some() {
                         let _ = event_tx
                             .send(Event::Disconnected {
                                 session,
@@ -527,7 +605,7 @@ async fn run_peer_session(
                 // session_id; if the peer disappeared while we held the
                 // outbound cmd, skip the event (the disconnect path
                 // will have already fired).
-                if let Some(session) = peers.session_for(peer_addr) {
+                if peers.peer_addr_for(session).is_some() {
                     let type_index = parse_outbound_type_index(&envelope);
                     let _ = event_tx
                         .send(Event::Sent {
@@ -554,13 +632,14 @@ enum Action {
 /// Returns `false` to signal the run loop should exit.
 async fn handle_inbound(
     peer_addr: SocketAddr,
+    session: SessionId,
     msg: CarrierEvent,
     event_tx: &Sender<Event>,
     peers: &Arc<PeerRegistry>,
 ) -> bool {
-    let Some(session) = peers.session_for(peer_addr) else {
+    if peers.peer_addr_for(session).is_none() {
         return true;
-    };
+    }
     match msg {
         CarrierEvent::MessageReceived { channel, data } => {
             // System / out-of-range channels are carrier control —
