@@ -104,8 +104,9 @@ impl AlcWorldPositionHandler {
 
     /// Sets the position: a step from the anchor when one fits, else a new
     /// anchor. The step is taken from the anchor as the receiver decodes it
-    /// (its height is a 16-bit bucket) and rounded, so the decoded position
-    /// is within half a step of `value`.
+    /// (its height is a 16-bit bucket) and truncated, as the live server
+    /// encodes it ([`crate::serialize::quantize_with_range`]), so the
+    /// decoded position is up to one step below `value` in each axis.
     pub fn set_value(&mut self, value: Vec3, quantization: f32) {
         let step = self
             .absolute_portion
@@ -796,10 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn a_position_is_received_at_the_nearest_place_not_below_it() {
+    fn a_position_is_anchored_at_the_nearest_place_and_stepped_to_the_one_below() {
         let q = 2.0;
         let half_bucket = 1100.0 / f32::from(u16::MAX) / 2.0;
-        let half_step = q / 255.0;
+        let step = 2.0 * q / 255.0;
         let (mut anchored, mut stepped) = ((0.0_f64, 0.0_f32), (0.0_f64, 0.0_f32));
         let n = 500;
         for i in 0..n {
@@ -821,15 +822,16 @@ mod tests {
                     .is_zero()
             );
             let error = as_received(&handler) - next;
+            assert!(error.max_element() <= 1e-4, "stepped above: {error}");
             stepped.0 += f64::from(error.z);
-            stepped.1 = stepped.1.max(error.abs().max_element());
+            stepped.1 = stepped.1.max((-error).max_element());
         }
         assert!(
             anchored.1 <= half_bucket + 1e-4,
             "anchored worst {}",
             anchored.1
         );
-        assert!(stepped.1 <= half_step + 1e-4, "stepped worst {}", stepped.1);
+        assert!(stepped.1 <= step + 1e-4, "stepped worst {}", stepped.1);
         let n = f64::from(n);
         assert!(
             (anchored.0 / n).abs() < 2e-3,
@@ -837,7 +839,7 @@ mod tests {
             anchored.0 / n
         );
         assert!(
-            (stepped.0 / n).abs() < 2e-3,
+            (stepped.0 / n + f64::from(step) / 2.0).abs() < 2e-3,
             "stepped mean {}",
             stepped.0 / n
         );

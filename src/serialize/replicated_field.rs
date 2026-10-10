@@ -997,12 +997,21 @@ impl From<QuantizedRelativePosition> for [u8; 3] {
     }
 }
 
-/// Quantizes `value` in `[-delta_range, delta_range]` to the nearest of 256
-/// steps.
+/// Quantizes `value` in `[-delta_range, delta_range]` to the step at or
+/// below it, of 256 steps: truncation, so the decoded value is up to one
+/// whole step below `value` and never above it.
+///
+/// That is the live server's encoding. The step grid has no zero (step
+/// `b` decodes to `delta_range * (2b / 255 - 1)`, so 127 and 128 are half
+/// a step either side of it), and the live server sends 127 for a zero
+/// difference, never 128; over the moving steps of recorded live sessions
+/// the decoded position sits on average half a step below the path the
+/// absolute anchors trace, in every axis and whichever way the player
+/// moves, as truncation and not rounding to the nearest step predicts.
 #[must_use]
 pub fn quantize_with_range(value: f32, delta_range: f32) -> u8 {
     let quantized = (value + delta_range) * 255.0 / (2.0 * delta_range);
-    f32_to_u8(quantized.clamp(0.0, 255.0).round())
+    f32_to_u8(quantized.clamp(0.0, 255.0).floor())
 }
 
 /// `value` as a decoder reads it back after codec `M` has written it.
@@ -1021,8 +1030,8 @@ pub fn wire_round_trip<T: Copy, M: Codec<T>>(value: &T) -> T {
 
 /// The quantized step from `anchor` to `value` in `[-range, range]`, or
 /// `None` when the caller must re-anchor instead: a component is `range` or
-/// more away, or the rounded step would be the `[255, 255, 255]` no-step
-/// sentinel.
+/// more away, or the step would be the `[255, 255, 255]` no-step sentinel
+/// (only a difference that rounds up to `range` in `f32` reaches it).
 #[must_use]
 pub fn quantize_relative_step(
     anchor: Vec3,
@@ -1267,29 +1276,43 @@ mod tests {
     use crate::serialize::buffer::CARRIER_ENDIAN;
 
     #[test]
-    fn quantize_with_range_rounds_to_the_nearest_step() {
+    fn quantize_with_range_truncates_to_the_step_at_or_below() {
         let range = 2.0_f32;
-        let half_step = range / 255.0;
+        let step = 2.0 * range / 255.0;
+        // The grid has no zero: a zero difference is 127, half a step below.
+        assert_eq!(quantize_with_range(0.0, range), 127);
+        assert_eq!(quantize_with_range(-0.0, range), 127);
+        assert_eq!(quantize_with_range(step / 2.0 + 1e-4, range), 128);
         let n = 2000;
         let (mut sum, mut worst) = (0.0_f32, 0.0_f32);
         for i in 0..n {
             #[expect(clippy::cast_precision_loss, reason = "small test index")]
             let value = -0.99 * range + 1.98 * range * (i as f32) / (n as f32);
             let error = unquantize_with_range(quantize_with_range(value, range), range) - value;
+            assert!(error <= 1e-5, "decoded {error} above {value}");
             sum += error;
-            worst = worst.max(error.abs());
+            worst = worst.max(-error);
         }
-        assert!(worst <= half_step + 1e-5, "worst {worst} > {half_step}");
+        assert!(worst <= step + 1e-5, "worst {worst} > {step}");
         #[expect(clippy::cast_precision_loss, reason = "small test count")]
         let mean = sum / (n as f32);
-        assert!(mean.abs() < half_step / 10.0, "mean {mean}");
+        assert!((mean + step / 2.0).abs() < step / 10.0, "mean {mean}");
     }
 
     #[test]
-    fn a_step_that_rounds_to_the_no_step_sentinel_asks_for_a_new_anchor() {
-        let range = 2.0;
-        assert!(quantize_relative_step(Vec3::ZERO, Vec3::splat(1.999), range).is_none());
-        assert!(quantize_relative_step(Vec3::ZERO, Vec3::new(1.999, 0.0, 0.0), range).is_some());
+    fn a_step_is_never_the_no_step_sentinel() {
+        let range = 2.0_f32;
+        let below = f32::from_bits(range.to_bits() - 1);
+        for value in [Vec3::splat(1.999), Vec3::splat(below)] {
+            assert_ne!(
+                quantize_relative_step(Vec3::ZERO, value, range),
+                Some(QuantizedRelativePosition::ZERO_SENTINEL)
+            );
+        }
+        assert_eq!(
+            quantize_relative_step(Vec3::ZERO, Vec3::splat(1.999), range),
+            Some(QuantizedRelativePosition::new([254, 254, 254]))
+        );
         assert!(quantize_relative_step(Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0), range).is_none());
     }
 
@@ -1489,15 +1512,15 @@ mod tests {
         assert_eq!(
             handler.quantized_relative_portion.value.unwrap(),
             QuantizedRelativePosition {
-                quantized_values: [64, 128, 191],
+                quantized_values: [63, 127, 191],
             }
         );
 
-        // Rounded to the nearest of the 256 steps: each within half a step
-        // (4/255 m) of the value set.
+        // Truncated to the step at or below: each up to one step (8/255 m)
+        // below the value set, a zero difference half a step below.
         let decoded = handler.value();
-        assert!((decoded.x - 8.007_843).abs() < 0.001, "{decoded:?}");
-        assert!((decoded.y - 20.015_686).abs() < 0.001, "{decoded:?}");
+        assert!((decoded.x - 7.976_470_5).abs() < 0.001, "{decoded:?}");
+        assert!((decoded.y - 19.984_314).abs() < 0.001, "{decoded:?}");
         assert!((decoded.z - 31.992_157).abs() < 0.001, "{decoded:?}");
     }
 }
