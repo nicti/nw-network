@@ -821,6 +821,54 @@
           "wireShape": "fixed-vector<u64,8>"
         }
       ]
+    },
+    {
+      "typeId": "CE7B5A7E-CD89-4626-B0A1-7FEE3F37D1A8",
+      "typeIndex": 6705,
+      "name": "Javelin::ClientMessages::PlayerCutsceneComponentServerFacet_OnClientCutsceneEnded",
+      "rustName": "PlayerCutsceneComponentServerFacetOnClientCutsceneEnded",
+      "source": "native-unmarshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Request",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        }
+      ]
+    },
+    {
+      "typeId": "982A8C1D-77CE-4455-A1C8-86A6BF0C0BA9",
+      "typeIndex": 6708,
+      "name": "Javelin::ClientMessages::PlayerCutsceneComponentClientFacet_OnServerCutsceneCanceled",
+      "rustName": "PlayerCutsceneComponentClientFacetOnServerCutsceneCanceled",
+      "source": "native-unmarshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Request",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        }
+      ]
+    },
+    {
+      "typeId": "D19070A4-AEA2-4E0D-9585-EC073F006828",
+      "typeIndex": 6709,
+      "name": "Javelin::ClientMessages::PlayerCutsceneComponentClientFacet_OnServerCutsceneEndRequestFinalized",
+      "rustName": "PlayerCutsceneComponentClientFacetOnServerCutsceneEndRequestFinalized",
+      "source": "native-unmarshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Request",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        }
+      ]
     }
   ]
 }

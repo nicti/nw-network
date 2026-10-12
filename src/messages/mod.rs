@@ -4,6 +4,8 @@ pub mod actor_mover;
 #[cfg(test)]
 mod chat;
 #[cfg(test)]
+mod cutscene;
+#[cfg(test)]
 mod objectives;
 pub mod registration;
 #[cfg(test)]
