@@ -651674,6 +651674,40 @@
               "confidence": "high"
             }
           ]
+        },
+        {
+          "index": 2,
+          "name": "field_2",
+          "nameAddress": null,
+          "group": null,
+          "handlerOffset": null,
+          "handlerExpression": null,
+          "storageExpression": "param_3 + 0x30",
+          "storageBase": "param_3",
+          "storageBaseOffset": 48,
+          "storageOffset": 48,
+          "wireShape": "vec<fixed-bytes-16>",
+          "wireShapeRaw": "vec<fixed-bytes-16>",
+          "wireLayout": "vec<fixed-bytes-16>",
+          "wireLayoutSource": "native-unmarshal-listing",
+          "wireShapeSource": "native-unmarshal-listing",
+          "unmarshalEvidence": {
+            "callsite": null,
+            "targetName": null,
+            "targetKind": null,
+            "evidenceSource": null
+          },
+          "callsite": "NewWorld+0x3477c50",
+          "confidence": "high",
+          "evidence": [
+            {
+              "kind": "message-unmarshal",
+              "source": "native-unmarshal-listing",
+              "address": "NewWorld+0x3477c50",
+              "detail": "counted sequence: packed-size count (client rejects more than 20), then 32-byte elements each reading a 16-byte id at +0x10",
+              "confidence": "high"
+            }
+          ]
         }
       ],
       "evidence": [
@@ -678978,6 +679012,40 @@
               "source": "message-unmarshal-call-frame-output-member",
               "address": "NewWorld+0x3478f48",
               "detail": "field_1",
+              "confidence": "high"
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "name": "field_2",
+          "nameAddress": null,
+          "group": null,
+          "handlerOffset": null,
+          "handlerExpression": null,
+          "storageExpression": "param_3 + 0x30",
+          "storageBase": "param_3",
+          "storageBaseOffset": 48,
+          "storageOffset": 48,
+          "wireShape": "vec<composite<fixed-bytes-16,string,string,u8,composite<u16,composite<f32,f32,f32,f32>,u16,composite<f32,f32,f32,f32>>,u32,u32,u32,f32,string>>",
+          "wireShapeRaw": "vec<composite<fixed-bytes-16,string,string,u8,composite<u16,composite<f32,f32,f32,f32>,u16,composite<f32,f32,f32,f32>>,u32,u32,u32,f32,string>>",
+          "wireLayout": "vec<composite<fixed-bytes-16,string,string,u8,composite<u16,composite<f32,f32,f32,f32>,u16,composite<f32,f32,f32,f32>>,u32,u32,u32,f32,string>>",
+          "wireLayoutSource": "native-unmarshal-listing",
+          "wireShapeSource": "native-unmarshal-listing",
+          "unmarshalEvidence": {
+            "callsite": null,
+            "targetName": null,
+            "targetKind": null,
+            "evidenceSource": null
+          },
+          "callsite": "NewWorld+0x3489090",
+          "confidence": "high",
+          "evidence": [
+            {
+              "kind": "message-unmarshal",
+              "source": "native-unmarshal-listing",
+              "address": "NewWorld+0x3489090",
+              "detail": "counted sequence of 0x100-byte OtherGuildData elements (NewWorld+0x5ce7390): id, m_guildName, m_guildMasterCharacterIdString, m_faction, m_crestData, m_numMembers, m_numClaims, m_numWars, m_siegeWindow, trailing string",
               "confidence": "high"
             }
           ]
