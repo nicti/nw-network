@@ -6,6 +6,8 @@ mod chat;
 #[cfg(test)]
 mod cutscene;
 #[cfg(test)]
+mod guilds;
+#[cfg(test)]
 mod request_id;
 #[cfg(test)]
 mod objectives;
