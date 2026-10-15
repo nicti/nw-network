@@ -7477,6 +7477,58 @@
           "wireShape": "composite<u64,u64>"
         }
       ]
+    },
+    {
+      "typeId": "754D385A-8BC0-46FB-A69E-2DDC56F3F162",
+      "typeIndex": 3639,
+      "name": "Javelin::ClientMessages::GuildsComponentServerFacet_RequestGetGuilds",
+      "rustName": "GuildsComponentServerFacetRequestGetGuilds",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Header",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "RequestId",
+          "wireShape": "fixed-bytes-16"
+        },
+        {
+          "index": 2,
+          "name": "GuildIds",
+          "wireShape": "vec<fixed-bytes-16>"
+        }
+      ]
+    },
+    {
+      "typeId": "5CBFE0ED-30ED-4F43-8C72-8726D54963C1",
+      "typeIndex": 3610,
+      "name": "Javelin::ClientMessages::GuildsComponentClientFacet_OnGetUnorderedGuildsMsg",
+      "rustName": "GuildsComponentClientFacetOnGetUnorderedGuildsMsg",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "Header",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "RequestId",
+          "wireShape": "fixed-bytes-16"
+        },
+        {
+          "index": 2,
+          "name": "Guilds",
+          "wireShape": "vec<composite<fixed-bytes-16,string,string,u8,composite<u16,composite<f32,f32,f32,f32>,u16,composite<f32,f32,f32,f32>>,u32,u32,u32,f32,string>>"
+        }
+      ]
     }
   ]
 }
