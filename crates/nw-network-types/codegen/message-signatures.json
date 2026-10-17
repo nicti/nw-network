@@ -7477,6 +7477,80 @@
           "wireShape": "composite<u64,u64>"
         }
       ]
+    },
+    {
+      "typeId": "67C97041-B839-4B0E-A8D5-49E68C47DB2C",
+      "typeIndex": 898,
+      "name": "Javelin::ClientMessages::EntitlementComponentServerFacet_ClientInitializeTransaction",
+      "rustName": "EntitlementComponentServerFacetClientInitializeTransaction",
+      "source": "native-unmarshal-and-marshal-listing",
+      "fields": [
+        {
+          "index": 0,
+          "name": "ActorRequestId",
+          "nativeType": "Javelin::ClientMessages::ActorRequestId",
+          "rustType": "::nw_network::ActorRequestId",
+          "wireShape": "composite<u64,u64>"
+        },
+        {
+          "index": 1,
+          "name": "AcceptLanguage",
+          "wireShape": "fixed-vector<u8,8>"
+        },
+        {
+          "index": 2,
+          "name": "Currency",
+          "wireShape": "fixed-vector<u8,8>"
+        },
+        {
+          "index": 3,
+          "name": "Country",
+          "wireShape": "fixed-vector<u8,8>"
+        },
+        {
+          "index": 4,
+          "name": "TransactionType",
+          "nativeType": "u32",
+          "wireShape": "u32"
+        },
+        {
+          "index": 5,
+          "name": "ClientTransactionId",
+          "wireShape": "fixed-bytes-16"
+        },
+        {
+          "index": 6,
+          "name": "ProductId",
+          "wireShape": "fixed-vector<u8,38>"
+        },
+        {
+          "index": 7,
+          "name": "OfferId",
+          "wireShape": "fixed-vector<u8,38>"
+        },
+        {
+          "index": 8,
+          "name": "ExternalOfferId",
+          "wireShape": "fixed-vector<u8,38>"
+        },
+        {
+          "index": 9,
+          "name": "InGameCurrencyAlias",
+          "wireShape": "fixed-vector<u8,256>"
+        },
+        {
+          "index": 10,
+          "name": "ExpectedAmount",
+          "nativeType": "u32",
+          "wireShape": "u32"
+        },
+        {
+          "index": 11,
+          "name": "Flag",
+          "nativeType": "bool",
+          "wireShape": "bool"
+        }
+      ]
     }
   ]
 }
