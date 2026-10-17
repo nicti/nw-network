@@ -8,12 +8,9 @@ repository = "https://github.com/themixednuts/nw-network"
 
 [dependencies]
 arrayvec = { version = "0.7.7", features = ["serde"] }
-bevy_app = "0.19"
-bevy_ecs = { version = "0.19", features = ["serialize"] }
-bevy_color = { version = "0.19", features = ["serialize"] }
-bevy_math = { version = "0.19", features = ["serialize"] }
+bevy_color = { version = "0.19", features = ["serialize", "bevy_reflect"] }
+bevy_math = { version = "0.19", features = ["serialize", "bevy_reflect"] }
 bevy_reflect = { version = "0.19", features = ["smallvec", "uuid"] }
-bevy_transform = { version = "0.19", features = ["serialize"] }
 sha1 = "0.11"
 serde = { version = "1", features = ["derive"] }
 smallvec = { version = "1", features = ["serde"] }

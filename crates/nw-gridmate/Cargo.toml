@@ -12,14 +12,15 @@ keywords = ["network", "gridmate", "bevy"]
 default = ["client"]
 client = []
 server = ["client"]
+bevy = ["client", "dep:bevy_app", "dep:bevy_ecs", "dep:bevy_tasks"]
 
 [dependencies]
 async-channel = "2.5"
 async-io = "2.6"
 async-lock = "3.4"
-bevy_app = "0.19"
-bevy_ecs = "0.19"
-bevy_tasks = "0.19"
+bevy_app = { version = "0.19", optional = true }
+bevy_ecs = { version = "0.19", optional = true }
+bevy_tasks = { version = "0.19", optional = true }
 bytes = "1"
 dashmap = "6.1"
 derive_more = { version = "2", features = ["deref", "display", "from", "into"] }

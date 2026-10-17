@@ -4,7 +4,7 @@
 //! for generated payload structs, serializer primitives, schema lookup, and
 //! shared ID/value types.
 
-#[cfg(feature = "client")]
+#[cfg(feature = "bevy")]
 pub mod bevy;
 pub mod capture;
 pub mod carrier;
@@ -25,7 +25,7 @@ pub use nw_network::{
     WriteBuffer, generated, network_schema, serialize, types,
 };
 
-#[cfg(feature = "client")]
+#[cfg(feature = "bevy")]
 pub use bevy::{
     BevyIoTaskSpawner, GridMatePlugin, GridMateSessionService, NetEvent, SessionConnectionRequest,
 };
