@@ -358,7 +358,7 @@ impl VlqU64Marshaler {
             data[2] = Self::byte_after_bits(v, 12);
             data[3] = Self::byte_after_bits(v, 20);
             wb.write_bytes(&data[..4]);
-        } else if v < 0x0000_0000_0800_0000 {
+        } else if v < 0x0000_0008_0000_0000 {
             data[0] = 0xf0 | byte(v & 0x07);
             data[1] = Self::byte_after_bits(v, 3);
             data[2] = Self::byte_after_bits(v, 11);
@@ -606,6 +606,33 @@ impl Unmarshal for VlqU64 {
 mod wrapper_tests {
     use super::*;
     use crate::serialize::buffer::CARRIER_ENDIAN;
+
+    /// `VlqU64Marshaler` writes the shortest form: an n-byte form holds
+    /// `7 * n - (n - 1)` bits up to eight bytes, so 5 bytes reach 2^35.
+    #[test]
+    fn vlq_u64_writes_the_shortest_form() {
+        let limits: [(u64, usize); 8] = [
+            (1 << 7, 1),
+            (1 << 14, 2),
+            (1 << 21, 3),
+            (1 << 28, 4),
+            (1 << 35, 5),
+            (1 << 42, 6),
+            (1 << 49, 7),
+            (1 << 56, 8),
+        ];
+        for (limit, len) in limits {
+            for v in [limit - 1, limit] {
+                let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+                VlqU64Marshaler.marshal(&mut wb, v);
+                let bytes = wb.into_vec();
+                let want = if v == limit { len + 1 } else { len };
+                assert_eq!(bytes.len(), want, "{v:#x}");
+                let mut rb = ReadBuffer::new(CARRIER_ENDIAN, &bytes);
+                assert_eq!(VlqU64Marshaler.unmarshal(&mut rb).unwrap(), v);
+            }
+        }
+    }
 
     /// `VlqU16` round-trips identically to `VlqU16Marshaler` itself, and
     /// rejects values that don't fit in u16 on read.

@@ -3,15 +3,16 @@
 pub mod actor_mover;
 #[cfg(test)]
 mod chat;
+pub mod client_input;
 #[cfg(test)]
 mod cutscene;
 #[cfg(test)]
 mod entitlement;
 #[cfg(test)]
-mod request_id;
-#[cfg(test)]
 mod objectives;
 pub mod registration;
+#[cfg(test)]
+mod request_id;
 #[cfg(test)]
 mod server_context;
 
