@@ -10,6 +10,8 @@ mod cutscene;
 #[cfg(test)]
 mod entitlement;
 #[cfg(test)]
+mod guilds;
+#[cfg(test)]
 mod objectives;
 pub mod registration;
 #[cfg(test)]
