@@ -358,7 +358,9 @@ fn load_schema_identities(path: &Path) -> Result<HashMap<String, SchemaIdentity>
     Ok(identities)
 }
 
-fn load_type_registry(path: &Path) -> Result<(HashMap<u32, Uuid>, HashMap<Uuid, u32>), AnyError> {
+type TypeRegistry = (HashMap<u32, Uuid>, HashMap<Uuid, u32>);
+
+fn load_type_registry(path: &Path) -> Result<TypeRegistry, AnyError> {
     let root: Value = serde_json::from_reader(BufReader::new(
         File::open(path).map_err(|error| path_error("open type registry", path, error))?,
     ))
@@ -637,7 +639,9 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0])?;
             let low = hex_nibble(pair[1])?;
