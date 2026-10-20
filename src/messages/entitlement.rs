@@ -56,16 +56,22 @@ mod tests {
     #[test]
     fn client_initialize_transaction_sizes_match_the_layout() {
         assert_eq!(body("abcdefghijklmnopqrstuv", "", 0).len(), 102);
-        assert_eq!(body("abcdefghijklmnopqrstuv", "0123456789abcdef", 1).len(), 118);
-        assert_eq!(body("abcdefghijklmnopqrstu", "0123456789abcdef", 1).len(), 116);
+        assert_eq!(
+            body("abcdefghijklmnopqrstuv", "0123456789abcdef", 1).len(),
+            118
+        );
+        assert_eq!(
+            body("abcdefghijklmnopqrstu", "0123456789abcdef", 1).len(),
+            116
+        );
     }
 
     #[test]
     fn client_initialize_transaction_fields_land_where_the_client_writes_them() {
         let bytes = body("abcdefghijklmnopqrstuv", "gold", 1);
         let mut rb = ReadBuffer::new(CARRIER_ENDIAN, &bytes);
-        let v = EntitlementComponentServerFacetClientInitializeTransaction::unmarshal(&mut rb)
-            .unwrap();
+        let v =
+            EntitlementComponentServerFacetClientInitializeTransaction::unmarshal(&mut rb).unwrap();
         assert_eq!(v.accept_language.as_slice(), b"xx-YY");
         assert_eq!(v.currency.as_slice(), b"ZZZ");
         assert_eq!(v.country.as_slice(), b"WW");
