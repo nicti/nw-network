@@ -184,6 +184,9 @@ impl QuatSmallestThreeQuantized {
     const COMPONENT_OFFSET: f32 = std::f32::consts::FRAC_1_SQRT_2;
     const SIGN_NEGATIVE: u8 = 1 << 0;
     const INDEX_SHIFT: u8 = 5;
+    /// Code units added before the floor, far under any value that matters
+    /// (`f32` noise on a byte is about 1.5e-5).
+    const FLOOR_GUARD: f32 = 1e-4;
 
     #[must_use]
     pub fn from_xyzw(x: f32, y: f32, z: f32, w: f32) -> Self {
@@ -223,10 +226,20 @@ impl QuatSmallestThreeQuantized {
         1 << (index + 1)
     }
 
+    /// The byte for `value`, truncated: the live server floors each carried
+    /// component, it does not round to the nearest byte. Over 35,565 recorded
+    /// moving inputs of the live server's own rotation, our component in
+    /// code units minus the live byte lay in `[0, 1)` in all four
+    /// (carried component, sign) groups; rounding would put it in
+    /// `[-0.5, 0.5)`. A decoded value is up to one step (`sqrt2 / 255`)
+    /// above the input.
+    ///
+    /// [`Self::FLOOR_GUARD`] keeps a decoded byte encoding back to itself:
+    /// the `f32` decode and re-encode can land a hair under the byte.
     fn quantize_component(value: f32) -> u8 {
         f32_to_u8(
-            ((value + Self::COMPONENT_OFFSET) / Self::COMPONENT_SCALE)
-                .round()
+            (((value + Self::COMPONENT_OFFSET) / Self::COMPONENT_SCALE) + Self::FLOOR_GUARD)
+                .floor()
                 .clamp(0.0, f32::from(u8::MAX)),
         )
     }
@@ -1057,6 +1070,26 @@ mod tests {
         assert!((decoded.components[1] - y).abs() < f32::EPSILON);
         assert_eq!(decoded.components[2].to_bits(), 0.0f32.to_bits());
         assert!(decoded.components[3] > 0.0);
+    }
+
+    #[test]
+    fn smallest_three_component_truncates_like_the_live_server() {
+        type Q = QuatSmallestThreeQuantized;
+        // Every byte decodes to a value that encodes back to it (a decoded
+        // live value re-encodes byte for byte).
+        for b in 0..=u8::MAX {
+            assert_eq!(Q::quantize_component(Q::unquantize_component(b)), b, "{b}");
+        }
+        // A value anywhere inside a step, short of the next byte, takes the
+        // byte below; the nearest-byte rounding of the old encoder took the
+        // next one from the middle of the step up.
+        for b in 0..u8::MAX {
+            let lo = Q::unquantize_component(b);
+            let step = Q::COMPONENT_SCALE;
+            for frac in [0.01f32, 0.1, 0.5, 0.9] {
+                assert_eq!(Q::quantize_component(lo + frac * step), b, "{b} + {frac}");
+            }
+        }
     }
 
     #[test]
