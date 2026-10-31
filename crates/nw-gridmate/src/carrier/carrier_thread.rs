@@ -185,13 +185,19 @@ impl<T: CarrierTransport> CarrierDriver<T> {
     /// `CarrierImpl::new` / `CarrierImpl::accept` are the entry
     /// points consumers go through.
     pub(crate) fn new(
-        thread_conn: ConnectionState<T>,
+        mut thread_conn: ConnectionState<T>,
         from_main_rx: Receiver<CarrierCommand>,
         to_main_tx: Sender<CarrierEvent>,
         shutdown_flag: StdArc<AtomicBool>,
         cleanup_done: Sender<()>,
         role: CarrierRole,
     ) -> Self {
+        // The client side does not answer an ACK-only datagram with
+        // another, as the real client does not; the responder keeps
+        // answering every datagram, unchanged on the wire to the real
+        // client. Either side not answering ends the ping-pong two of
+        // these carriers would otherwise keep up.
+        thread_conn.ack_only_requests_ack = role == CarrierRole::Responder;
         Self {
             thread_conn,
             role,
@@ -818,4 +824,105 @@ pub fn message_header_size(
     }
 
     size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::carrier::connection_state::ConnectionState;
+    use crate::driver::DriverError;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::AtomicUsize;
+
+    /// One end of an in-memory link: what it writes is the other end's
+    /// read, and every write is counted.
+    struct Link {
+        inbound: Receiver<bytes::Bytes>,
+        outbound: Sender<bytes::Bytes>,
+        written: StdArc<AtomicUsize>,
+    }
+
+    impl CarrierTransport for Link {
+        fn peer_addr(&self) -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        }
+
+        async fn read(&mut self) -> Result<bytes::Bytes, DriverError> {
+            self.inbound
+                .recv()
+                .await
+                .map_err(|_| DriverError::Ssl("link closed".into()))
+        }
+
+        fn try_recv(&mut self) -> Result<Option<bytes::Bytes>, DriverError> {
+            Ok(self.inbound.try_recv().ok())
+        }
+
+        async fn write(&mut self, data: bytes::Bytes) -> Result<usize, DriverError> {
+            self.written.fetch_add(1, Ordering::Relaxed);
+            let len = data.len();
+            let _ = self.outbound.send(data).await;
+            Ok(len)
+        }
+    }
+
+    /// An initiator and a responder, connected and idle for 600 ms,
+    /// send the handshake, the 100 ms ACK ceiling and the responder's
+    /// answers to it: a few dozen datagrams. When both answered every
+    /// ACK-only datagram, they sent ACK-only datagrams back and forth as
+    /// fast as the link carried them (about 3,800 a second each way over
+    /// loopback between a client and a server process; far more here).
+    #[test]
+    fn an_idle_initiator_and_responder_do_not_ping_pong_acks() {
+        let (a_tx, a_rx) = async_channel::unbounded();
+        let (b_tx, b_rx) = async_channel::unbounded();
+        let mut runs = Vec::new();
+        let mut keep = Vec::new();
+        let mut counts = Vec::new();
+        let mut flags = Vec::new();
+        for (role, inbound, outbound) in [
+            (CarrierRole::Initiator, a_rx, b_tx),
+            (CarrierRole::Responder, b_rx, a_tx),
+        ] {
+            let written = StdArc::new(AtomicUsize::new(0));
+            let link = Link {
+                inbound,
+                outbound,
+                written: written.clone(),
+            };
+            let (cmd_tx, cmd_rx) = async_channel::unbounded();
+            let (event_tx, event_rx) = async_channel::unbounded();
+            let (cleanup_tx, cleanup_rx) = async_channel::bounded(1);
+            let flag = StdArc::new(AtomicBool::new(false));
+            let driver = CarrierDriver::new(
+                ConnectionState::new(link),
+                cmd_rx,
+                event_tx,
+                flag.clone(),
+                cleanup_tx,
+                role,
+            );
+            runs.push(std::thread::spawn(move || async_io::block_on(driver.run())));
+            keep.push((cmd_tx, event_rx, cleanup_rx));
+            counts.push(written);
+            flags.push(flag);
+        }
+
+        std::thread::sleep(Duration::from_millis(600));
+        let sent: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        for flag in &flags {
+            flag.store(true, Ordering::Relaxed);
+        }
+        for run in runs {
+            run.join().unwrap();
+        }
+        drop(keep);
+
+        let connected = sent.iter().all(|&n| n > 0);
+        assert!(connected, "both sides sent something: {sent:?}");
+        assert!(
+            sent.iter().sum::<usize>() < 200,
+            "datagrams sent in 600 ms (initiator, responder): {sent:?}"
+        );
+    }
 }
