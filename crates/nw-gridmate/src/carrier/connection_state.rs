@@ -91,6 +91,16 @@ pub struct ConnectionState<T: CarrierTransport> {
     /// Whether we've received any datagram since the last send (response-based ACK trigger)
     received_since_last_send: bool,
 
+    /// Whether a received ACK-only datagram (every frame an `SM_CT_ACKS`)
+    /// asks for an ACK back, like any other datagram. `true` keeps the
+    /// responder's behaviour as it was. The initiator sets it `false`
+    /// (see [`super::carrier_thread::CarrierDriver::new`]): the real
+    /// client does not answer the server's ACK-only datagrams, and two
+    /// carriers that both answer them ping-pong ACK-only datagrams at the
+    /// link's round trip for as long as the connection lasts (about
+    /// 3,800 a second each way over loopback).
+    pub(crate) ack_only_requests_ack: bool,
+
     /// Connection create time
     pub create_time: Instant,
 
@@ -144,6 +154,7 @@ impl<T: CarrierTransport> ConnectionState<T> {
             last_acked_datagram: SequenceNumber::ZERO,
             last_ack_send_time: now, // Initialize to now - connect_request sends first ACK
             received_since_last_send: false,
+            ack_only_requests_ack: true,
             // GridMate: m_sendSeqNum[all] = SequenceNumberMax (0xFFFF)
             send_seq_num: [SEQUENCE_NUMBER_MAX; MAX_CHANNELS],
             // GridMate: m_sendReliableSeqNum[all] = SequenceNumberMax (0xFFFF)
@@ -290,19 +301,30 @@ impl<T: CarrierTransport> ConnectionState<T> {
             preview
         );
 
-        // We received data - flag for response-based ACK. Done up
-        // front so the `received_since_last_send` flag flips even
-        // when decode or dedup later rejects the datagram (the peer
+        // We received data - flag for response-based ACK. Done before
+        // the dedup check so the `received_since_last_send` flag flips
+        // even when decode or dedup later rejects the datagram (the peer
         // still acked a UDP packet our way, the carrier still wants
-        // to acknowledge it).
-        self.received_since_last_send = true;
-
+        // to acknowledge it). The one exception is an ACK-only datagram
+        // on a carrier that does not answer those
+        // (`ack_only_requests_ack`); it is still recorded in the history
+        // below and acknowledged by the next ACK this side sends.
+        //
         // Decode first, stage later: the duplicate check below needs
         // the header, and must run before any frame reaches the
         // reassembler -- a staged frame cannot be taken back, so a
         // repeated datagram would deliver its unreliable frames twice.
         // Envelope parsing happens above this.
-        let decoded = decode_datagram(data).map_err(|e| format!("decode datagram: {e}"))?;
+        let decoded = match decode_datagram(data) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                self.received_since_last_send = true;
+                return Err(format!("decode datagram: {e}"));
+            }
+        };
+        if self.ack_only_requests_ack || !is_ack_only(&decoded.frames) {
+            self.received_since_last_send = true;
+        }
 
         let header = decoded.header;
         debug!(
@@ -922,6 +944,17 @@ impl<T: CarrierTransport> ConnectionState<T> {
     }
 }
 
+/// Every frame of the datagram is an `SM_CT_ACKS` on the system channel:
+/// an ACK-only datagram, the kind `prepare_outgoing_datagram` sends when
+/// it has nothing but ACKs to send.
+fn is_ack_only(frames: &[MessageData]) -> bool {
+    !frames.is_empty()
+        && frames.iter().all(|frame| {
+            frame.channel == SYSTEM_CHANNEL
+                && frame.data.last() == Some(&system_message::SM_CT_ACKS)
+        })
+}
+
 impl<T: CarrierTransport> ConnectionState<T> {
     /// Pop the next ready message from a channel's inbox (the
     /// `to_receive` per-channel queue). Used by
@@ -1009,19 +1042,171 @@ mod tests {
         let datagram = Bytes::from(bytes);
 
         let mut conn = ConnectionState::new(NullTransport);
-        conn.process_incoming_datagram(datagram.clone()).expect("first copy");
+        conn.process_incoming_datagram(datagram.clone())
+            .expect("first copy");
         assert_eq!(
             conn.process_incoming_datagram(datagram).unwrap_err(),
             "Duplicate datagram"
         );
         // A later datagram drains whatever the reassembler holds.
         let empty = Bytes::from_static(&[DatagramHeader::UNCOMPRESSED, 0, 0, 8]);
-        conn.process_incoming_datagram(empty).expect("empty datagram");
+        conn.process_incoming_datagram(empty)
+            .expect("empty datagram");
 
         let ch = channel.id() as usize;
         let got: Vec<_> = std::iter::from_fn(|| conn.pop_ready_message(ch))
             .map(|m| m.data.to_vec())
             .collect();
         assert_eq!(got, vec![payload.to_vec()], "delivered exactly once");
+    }
+
+    /// One unreliable user frame on channel 0, queued and sent.
+    fn queue_user_frame(conn: &mut ConnectionState<NullTransport>) {
+        let message = MessageData {
+            channel: 0,
+            reliability: DataReliability::Unreliable,
+            data: Bytes::from_static(b"input"),
+            ..Default::default()
+        };
+        conn.queue_message(message, 2);
+    }
+
+    /// Hands each datagram one side sends straight to the other, the way
+    /// the carrier driver answers a received datagram at once, and counts
+    /// the datagrams that follow the first until a side has nothing to
+    /// send. Stops at `cap`.
+    fn answers_until_quiet(
+        sides: &mut [ConnectionState<NullTransport>; 2],
+        first: usize,
+        cap: usize,
+    ) -> usize {
+        let mut datagram = sides[first]
+            .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+            .unwrap()
+            .expect("the first datagram");
+        let mut to = 1 - first;
+        let mut answers = 0;
+        while answers < cap {
+            sides[to].process_incoming_datagram(datagram).unwrap();
+            match sides[to]
+                .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+                .unwrap()
+            {
+                Some(next) => {
+                    datagram = next;
+                    to = 1 - to;
+                    answers += 1;
+                }
+                None => break,
+            }
+        }
+        answers
+    }
+
+    /// Two carriers that both answer every datagram, ACK-only ones
+    /// included, ping-pong ACK-only datagrams for as long as they are
+    /// connected. A carrier that does not answer ACK-only datagrams ends
+    /// that after one round; the side that still answers them (the
+    /// responder, the server) answers exactly as before.
+    #[test]
+    fn an_ack_only_datagram_is_not_answered_by_a_carrier_that_does_not_answer_them() {
+        const CAP: usize = 50;
+        let responder = || ConnectionState::new(NullTransport);
+        let initiator = || {
+            let mut conn = ConnectionState::new(NullTransport);
+            conn.ack_only_requests_ack = false;
+            conn
+        };
+
+        // The responder sends data: the initiator ACKs it, the responder
+        // answers that ACK-only datagram, and the initiator does not.
+        let mut sides = [responder(), initiator()];
+        queue_user_frame(&mut sides[0]);
+        assert_eq!(answers_until_quiet(&mut sides, 0, CAP), 2);
+
+        // The initiator sends data: the responder ACKs it, and that is all.
+        let mut sides = [responder(), initiator()];
+        queue_user_frame(&mut sides[1]);
+        assert_eq!(answers_until_quiet(&mut sides, 1, CAP), 1);
+
+        // Both answering ACK-only datagrams never goes quiet.
+        let mut sides = [responder(), responder()];
+        queue_user_frame(&mut sides[0]);
+        assert_eq!(answers_until_quiet(&mut sides, 0, CAP), CAP);
+    }
+
+    /// An unanswered ACK-only datagram is still in the history: the next
+    /// ACK the initiator sends acknowledges it.
+    #[test]
+    fn an_unanswered_ack_only_datagram_is_acknowledged_by_the_next_ack() {
+        let mut responder = ConnectionState::new(NullTransport);
+        let mut initiator = ConnectionState::new(NullTransport);
+        initiator.ack_only_requests_ack = false;
+
+        // An ACK-only datagram from the responder: answer the
+        // initiator's data, then take the ACK it sends.
+        queue_user_frame(&mut initiator);
+        let data = initiator
+            .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+            .unwrap()
+            .unwrap();
+        responder.process_incoming_datagram(data).unwrap();
+        let ack_only = responder
+            .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+            .unwrap()
+            .unwrap();
+        let seq = decode_datagram(ack_only.clone())
+            .unwrap()
+            .header
+            .sequence_number;
+        assert!(is_ack_only(
+            &decode_datagram(ack_only.clone()).unwrap().frames
+        ));
+
+        initiator.process_incoming_datagram(ack_only).unwrap();
+        assert!(
+            initiator
+                .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+                .unwrap()
+                .is_none(),
+            "an ACK-only datagram asks the initiator for nothing"
+        );
+
+        // Its next datagram carries the ACK, and the ACK covers it.
+        queue_user_frame(&mut responder);
+        let more = responder
+            .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+            .unwrap()
+            .unwrap();
+        initiator.process_incoming_datagram(more).unwrap();
+        initiator
+            .prepare_outgoing_datagram(mtu::MAX_DATAGRAM_SIZE)
+            .unwrap()
+            .expect("data asks for an ACK");
+        assert!(
+            initiator.last_acked_datagram >= seq,
+            "acked up to {:?}, the ACK-only datagram was {:?}",
+            initiator.last_acked_datagram,
+            seq
+        );
+    }
+
+    #[test]
+    fn only_a_datagram_of_acks_alone_is_ack_only() {
+        let frame = |channel: u8, data: &'static [u8]| MessageData {
+            channel,
+            data: Bytes::from_static(data),
+            ..Default::default()
+        };
+        let acks = || frame(SYSTEM_CHANNEL, &[0x00, system_message::SM_CT_ACKS]);
+        assert!(is_ack_only(&[acks()]));
+        assert!(is_ack_only(&[acks(), acks()]));
+        assert!(!is_ack_only(&[]));
+        assert!(!is_ack_only(&[acks(), frame(0, b"input")]));
+        assert!(!is_ack_only(&[frame(0, &[system_message::SM_CT_ACKS])]));
+        assert!(!is_ack_only(&[frame(
+            SYSTEM_CHANNEL,
+            &[0, 0, 0, 1, system_message::SM_CONNECT_REQUEST]
+        )]));
     }
 }
