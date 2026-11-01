@@ -870,7 +870,7 @@ impl<T: CarrierTransport> ConnectionState<T> {
                 for priority in 0..PRIORITY_MAX {
                     if !dgram.to_resend[priority].is_empty() {
                         let resend_msgs: Vec<MessageData> =
-                            dgram.to_resend[priority].drain(..).collect();
+                            std::mem::take(&mut dgram.to_resend[priority]);
                         let count = resend_msgs.len();
 
                         // Splice resend messages to the front

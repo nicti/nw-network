@@ -1,10 +1,10 @@
 //! Concrete network message payloads.
 
 pub mod actor_mover;
-pub mod component_pair;
 #[cfg(test)]
 mod chat;
 pub mod client_input;
+pub mod component_pair;
 #[cfg(test)]
 mod cutscene;
 #[cfg(test)]

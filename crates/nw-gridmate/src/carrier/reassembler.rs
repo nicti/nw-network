@@ -329,6 +329,20 @@ pub struct Drain<'a> {
     channel: usize,
 }
 
+impl<'a> Iterator for Drain<'a> {
+    type Item = (u8, MessageData);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.channel < MAX_CHANNELS {
+            if let Some(msg) = self.reassembler.next_ready(self.channel) {
+                return Some((self.channel as u8, msg));
+            }
+            self.channel += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,19 +588,5 @@ mod tests {
         r.accept(frame(1, true, 3, 0xffff, b"a repeat from before it"));
         r.accept(frame(1, true, 4, 1, b"next"));
         assert_eq!(delivered(&mut r), vec![b"next".to_vec()]);
-    }
-}
-
-impl<'a> Iterator for Drain<'a> {
-    type Item = (u8, MessageData);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.channel < MAX_CHANNELS {
-            if let Some(msg) = self.reassembler.next_ready(self.channel) {
-                return Some((self.channel as u8, msg));
-            }
-            self.channel += 1;
-        }
-        None
     }
 }
