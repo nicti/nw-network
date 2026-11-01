@@ -120,7 +120,7 @@ pub use quests::{
 };
 pub use scripting::{
     InstancedSlayerScriptReplicatedState, InstancedSlayerScriptSnapshot,
-    SlayerScriptReplicatedState,
+    SlayerScriptReplicatedState, SyncedTimerMap, SyncedTimerValueMarshaler,
 };
 pub use social::{
     ChatMuteEntry, ChatMutes, ChatReplicatedState, EligibleTerritoryWar, GameInviteData,

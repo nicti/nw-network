@@ -840,7 +840,7 @@ impl<T> ReplicatedContainerStorage for Vec<T> {
         VM: Codec<Self::Value>,
     {
         for value in self {
-            VM::marshal(value, wb);
+            VM::marshal_snapshot(value, wb);
         }
     }
 
@@ -851,7 +851,7 @@ impl<T> ReplicatedContainerStorage for Vec<T> {
     {
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            values.push(VM::unmarshal(rb)?);
+            values.push(VM::unmarshal_snapshot(rb)?);
         }
         Ok(values)
     }
@@ -938,7 +938,7 @@ where
     {
         for (key, value) in self {
             KM::marshal(key, wb);
-            VM::marshal(value, wb);
+            VM::marshal_snapshot(value, wb);
         }
     }
 
@@ -949,7 +949,7 @@ where
     {
         let mut values = HashMap::with_capacity_and_hasher(count, S::default());
         for _ in 0..count {
-            values.insert(KM::unmarshal(rb)?, VM::unmarshal(rb)?);
+            values.insert(KM::unmarshal(rb)?, VM::unmarshal_snapshot(rb)?);
         }
         Ok(values)
     }
@@ -1016,7 +1016,7 @@ where
     {
         for (key, value) in self {
             KM::marshal(key, wb);
-            VM::marshal(value, wb);
+            VM::marshal_snapshot(value, wb);
         }
     }
 
@@ -1027,7 +1027,7 @@ where
     {
         let mut values = IndexMap::with_capacity(count);
         for _ in 0..count {
-            values.insert(KM::unmarshal(rb)?, VM::unmarshal(rb)?);
+            values.insert(KM::unmarshal(rb)?, VM::unmarshal_snapshot(rb)?);
         }
         Ok(values)
     }

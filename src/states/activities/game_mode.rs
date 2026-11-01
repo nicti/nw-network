@@ -9,12 +9,12 @@ use crate::serialize::{
     WIRE_VEC_CAP, WriteBuffer,
 };
 use crate::types::{
-    Crc32, EntityRef, GameModeParticipantStatus,
+    EntityRef, GameModeParticipantStatus,
     RemoteServerFacetRefGameModeParticipantComponentServerFacet,
 };
 
 pub type GameModeIndexedByteMap = ReplicatedContainer<IndexMap<VlqU64, u8>>;
-pub type GameModeTimerMap = ReplicatedContainer<IndexMap<Crc32, VlqU64>>;
+pub type GameModeTimerMap = crate::states::scripting::SyncedTimerMap;
 pub type GameModeParticipantFacetRefs = ReplicatedContainer<
     IndexMap<VlqU64, RemoteServerFacetRefGameModeParticipantComponentServerFacet>,
 >;
@@ -68,7 +68,8 @@ pub struct GameModeMapIcon {
     pub icon_id: u32,
     pub position: Vec2,
 }
-pub use crate::generated::states::GameModeReplicatedState;
+mod state;
+pub use state::GameModeReplicatedState;
 #[cfg(test)]
 mod tests {
     use super::*;
