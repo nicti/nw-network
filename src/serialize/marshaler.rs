@@ -58,6 +58,26 @@ pub trait Codec<T> {
     ///
     /// Returns an error when the buffer does not contain a valid value for this policy.
     fn unmarshal(rb: &mut ReadBuffer) -> Result<T, MarshalerError>;
+
+    /// Serialize `value` as an entry of a replicated container's snapshot.
+    ///
+    /// The same as [`Codec::marshal`] unless the container's handler writes
+    /// snapshot entries in another shape than delta changes.
+    fn marshal_snapshot(value: &T, wb: &mut WriteBuffer) {
+        Self::marshal(value, wb);
+    }
+
+    /// Deserialize a `T` from an entry of a replicated container's snapshot.
+    ///
+    /// The same as [`Codec::unmarshal`] unless the container's handler reads
+    /// snapshot entries in another shape than delta changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the buffer does not contain a valid value for this policy.
+    fn unmarshal_snapshot(rb: &mut ReadBuffer) -> Result<T, MarshalerError> {
+        Self::unmarshal(rb)
+    }
 }
 
 /// Default policy for a value that marshals itself.

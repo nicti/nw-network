@@ -10,8 +10,44 @@ use crate::{az_rtti, replicated_state, type_registry};
 
 use glam::Vec3;
 
-use crate::serialize::{IndexMap, ReplicatedContainer, ReplicatedFieldHandler, VlqU64};
+use crate::serialize::{
+    Codec, DefaultMarshaler, IndexMap, Marshal, MarshalerError, ReadBuffer, ReplicatedContainer,
+    ReplicatedFieldHandler, Unmarshal, VlqU64, WIRE_VEC_CAP, WriteBuffer,
+};
 use crate::types::{Crc32, EntityId};
+
+/// Value policy of the scripted timer maps (`syncedTimers`, and the game
+/// mode's `values`): the client's handler reads a delta change's timer as a
+/// VLQ, but a snapshot entry's timer as a fixed big-endian `u64`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncedTimerValueMarshaler;
+
+impl Codec<VlqU64> for SyncedTimerValueMarshaler {
+    fn marshal(value: &VlqU64, wb: &mut WriteBuffer) {
+        value.marshal(wb);
+    }
+
+    fn unmarshal(rb: &mut ReadBuffer) -> Result<VlqU64, MarshalerError> {
+        VlqU64::unmarshal(rb)
+    }
+
+    fn marshal_snapshot(value: &VlqU64, wb: &mut WriteBuffer) {
+        value.get().marshal(wb);
+    }
+
+    fn unmarshal_snapshot(rb: &mut ReadBuffer) -> Result<VlqU64, MarshalerError> {
+        u64::unmarshal(rb).map(VlqU64::new)
+    }
+}
+
+/// A scripted timer map: CRC key to timer, with the timer's snapshot and
+/// delta shapes of [`SyncedTimerValueMarshaler`].
+pub type SyncedTimerMap = ReplicatedContainer<
+    IndexMap<Crc32, VlqU64>,
+    WIRE_VEC_CAP,
+    DefaultMarshaler<Crc32>,
+    SyncedTimerValueMarshaler,
+>;
 
 /// Base scripted-encounter state.
 ///
@@ -29,7 +65,7 @@ pub struct SlayerScriptReplicatedState {
     pub cur_script_id: ReplicatedFieldHandler<Crc32>,
     /// Local timer map intentionally omitted from the base state's wire fields.
     #[replicated_state(skip)]
-    pub synced_timers: ReplicatedContainer<IndexMap<Crc32, VlqU64>>,
+    pub synced_timers: SyncedTimerMap,
     /// Spawned entity ids keyed by script spawner id.
     pub spawned_entity_ids_by_spawner_id: ReplicatedContainer<IndexMap<Crc32, EntityId>>,
 }
@@ -50,7 +86,7 @@ pub struct InstancedSlayerScriptReplicatedState {
     /// Spawned entity ids keyed by script spawner id.
     pub spawned_entity_ids_by_spawner_id: ReplicatedContainer<IndexMap<Crc32, EntityId>>,
     /// Replicated timer map for this script instance.
-    pub synced_timers: ReplicatedContainer<IndexMap<Crc32, VlqU64>>,
+    pub synced_timers: SyncedTimerMap,
 
     /// Group 1 script tag identity.
     #[replicated_state(group = 1)]
@@ -145,6 +181,51 @@ mod tests {
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // entity id
             ]
         );
+    }
+
+    #[test]
+    fn synced_timer_snapshot_carries_a_fixed_u64_timer() {
+        let mut values = IndexMap::new();
+        values.insert(Crc32::new(0x1122_3344), VlqU64::new(0x80));
+        let map = SyncedTimerMap::new(7, values);
+
+        let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+        map.marshal(&mut wb);
+        assert_eq!(
+            wb.as_slice(),
+            &[
+                0x00, // snapshot mode
+                0x01, 0x07, // last-modified sequence
+                0x01, // entry count
+                0x11, 0x22, 0x33, 0x44, // CRC key
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // timer, fixed u64
+            ]
+        );
+
+        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, wb.as_slice());
+        let decoded = SyncedTimerMap::unmarshal(&mut rb).unwrap();
+        assert_eq!(rb.left(), 0);
+        assert_eq!(
+            decoded.values().get(&Crc32::new(0x1122_3344)),
+            Some(&VlqU64::new(0x80))
+        );
+    }
+
+    #[test]
+    fn synced_timer_delta_carries_a_vlq_timer() {
+        let bytes = [
+            0x01, // one change
+            0x01, // live
+            0x11, 0x22, 0x33, 0x44, // CRC key
+            0x01, 0x09, // sequence 9
+            0x80, 0x02, // timer 0x80, VLQ
+        ];
+        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, &bytes);
+        let decoded = SyncedTimerMap::unmarshal(&mut rb).unwrap();
+        assert_eq!(rb.left(), 0);
+        let changes = decoded.current_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].value(), Some(&VlqU64::new(0x80)));
     }
 
     #[test]
