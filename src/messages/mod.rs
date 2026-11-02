@@ -5,6 +5,7 @@ pub mod actor_mover;
 mod chat;
 pub mod client_input;
 pub mod component_pair;
+pub mod contracts;
 #[cfg(test)]
 mod cutscene;
 #[cfg(test)]
