@@ -124,14 +124,15 @@ pub use scripting::{
 };
 pub use social::{
     ChatMuteEntry, ChatMutes, ChatReplicatedState, EligibleTerritoryWar, GameInviteData,
-    GroupFinderApplicationData, GroupInviteData, GroupMemberHouseId,
-    GroupsComponentReplicatedState, GuildCrestColor, GuildCrestData, GuildInviteSenderData,
-    GuildInviteStateData, GuildPlayerIdentification, GuildsComponentReplicatedState,
-    MAX_TEMPORARY_AFFILIATION_CHANGES, MagicComponentReplicatedState,
-    OwnershipComponentReplicatedState, PlayerGenericInviteParticipants,
-    PlayerGenericInviteReplicatedState, ReplicatedGuildInfluence, SocialCollectionsSnapshot,
-    SocialReplicatedState, TemporaryAffiliation, TemporaryAffiliationRelationship,
-    TemporaryAffiliationReplicatedState, TemporaryAffiliationType,
+    GroupDataComponentReplicatedState, GroupFinderApplicationData, GroupInviteData,
+    GroupMemberHouseId, GroupsComponentReplicatedState, GuildCrestColor, GuildCrestData,
+    GuildInviteSenderData, GuildInviteStateData, GuildPlayerIdentification,
+    GuildsComponentReplicatedState, MAX_TEMPORARY_AFFILIATION_CHANGES,
+    MagicComponentReplicatedState, OwnershipComponentReplicatedState,
+    PlayerGenericInviteParticipants, PlayerGenericInviteReplicatedState, ReplicatedGuildInfluence,
+    SocialCollectionsSnapshot, SocialReplicatedState, TemporaryAffiliation,
+    TemporaryAffiliationRelationship, TemporaryAffiliationReplicatedState,
+    TemporaryAffiliationType,
 };
 pub use spawning::{
     EncounterComponentReplicatedState, EncounterManagerComponentReplicatedState,
