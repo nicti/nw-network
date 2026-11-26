@@ -330,8 +330,11 @@ impl Unmarshal for ReplicationControl {
 
 /// Replication-control ids split into stop ids followed by pause ids.
 ///
-/// The wire payload carries the total id count, the pause partition start, and
-/// then the ordered id list.
+/// The wire payload carries the pause partition start (the stop id count), the
+/// total id count, and then the ordered id list. Live bundles that stop and
+/// pause ids at once show this order: the id list and the bundle buffer
+/// length that follows it line up only with the second byte as the count.
+/// With only stop ids both bytes are equal, so either order reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplicationControlData {
     pause_start_idx: u32,
@@ -476,8 +479,8 @@ impl Marshal for ReplicationControlData {
             self.pause_start() <= self.interest_ids.len(),
             "ReplicationControlData split must be within the id list"
         );
-        wb.write_u8(u8::try_from(self.interest_ids.len()).expect("control id cap fits in u8"));
         wb.write_u8(u8::try_from(self.pause_start_idx).expect("control id cap fits in u8"));
+        wb.write_u8(u8::try_from(self.interest_ids.len()).expect("control id cap fits in u8"));
         for interest_id in &self.interest_ids {
             interest_id.get().marshal(wb);
         }
@@ -486,6 +489,7 @@ impl Marshal for ReplicationControlData {
 
 impl Unmarshal for ReplicationControlData {
     fn unmarshal(rb: &mut ReadBuffer) -> Result<Self, MarshalerError> {
+        let pause_start_idx = rb.read_u8()?;
         let len = usize::from(rb.read_u8()?);
         if len > MAX_REPLICATION_CONTROL_IDS {
             return Err(MarshalerError::ContainerOverflow {
@@ -493,7 +497,6 @@ impl Unmarshal for ReplicationControlData {
                 capacity: MAX_REPLICATION_CONTROL_IDS,
             });
         }
-        let pause_start_idx = rb.read_u8()?;
         if usize::from(pause_start_idx) > len {
             return Err(MarshalerError::InvalidRange {
                 value: u64::from(pause_start_idx),
@@ -1564,7 +1567,7 @@ mod tests {
         let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
         data.marshal(&mut wb);
 
-        assert_eq!(wb.as_slice(), &[5, 2, 0, 10, 0, 11, 0, 20, 0, 21, 0, 22]);
+        assert_eq!(wb.as_slice(), &[2, 5, 0, 10, 0, 11, 0, 20, 0, 21, 0, 22]);
 
         let mut rb = ReadBuffer::new(CARRIER_ENDIAN, wb.as_slice());
         let decoded = ReplicationControlData::unmarshal(&mut rb).unwrap();
@@ -1582,6 +1585,22 @@ mod tests {
             ]
         );
         assert_eq!(decoded.len(), 5);
+    }
+
+    #[test]
+    fn a_bundle_that_stops_and_pauses_ids_reads_in_live_order() {
+        // Sequence 7, context 1, bandwidth mode 3, unreliable, replication
+        // control: pause start 2, then 3 ids (two stopped, one paused), then
+        // an empty state buffer. The ids are made up; the layout is live's.
+        let body = [1, 7, 1, 3, 1, 1, 2, 3, 0, 10, 0, 11, 0, 20, 0];
+        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, &body);
+        let bundle = ReplicatedStateBundleView::read_from(&mut rb).unwrap();
+        assert_eq!(rb.position(), body.len());
+        assert_eq!(
+            bundle.stop_replication_ids(),
+            &[InterestId::new(10), InterestId::new(11)]
+        );
+        assert_eq!(bundle.pause_replication_ids(), &[InterestId::new(20)]);
     }
 
     #[test]
