@@ -52,7 +52,7 @@ pub use combat::{
     ReplicatedGeneralCooldown, SpellComponentReplicatedState, StaminaComponentReplicatedState,
     StatMultiplierSnapshot, StatMultiplierTableComponentReplicatedState, StatMultiplierValue,
     StatusEffectInstanceData, StatusEffectsComponentReplicatedState, StatusEffectsSnapshot,
-    TerritoryStatusEffect, VitalsComponentReplicatedState, VitalsStateData,
+    TerritoryStatusEffect, TurretReplicatedState, VitalsComponentReplicatedState, VitalsStateData,
 };
 pub use economy::{
     AggregateContractCountComponentReplicatedState, ContributionComponentReplicatedState,
