@@ -143,7 +143,8 @@ pub use territory::{
     FactionComponentReplicatedState, InfluenceRaceData, LandClaimComponentReplicatedState,
     LandClaimGovernanceData, LandClaimManagerComponentReplicatedState, LandClaimOwnerData,
     LandClaimProgressionData, LandClaimProgressionPair, LandClaimProgressionTriple,
-    LandClaimSnapshot, WarDataAssetReference, WarDataComponentReplicatedState, WarDataDetailBlock,
+    LandClaimSnapshot, TerritoryGovernanceData, TerritoryGovernanceTriple,
+    TerritoryInterfaceComponentReplicatedState, WarDataAssetReference, WarDataComponentReplicatedState, WarDataDetailBlock,
     WarDataParticipantBlock, WarDataSnapshot, WarDataUuidList, WarDataValue,
     WarScheduleAdjustmentReplicatedState,
 };
