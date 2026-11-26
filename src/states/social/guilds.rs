@@ -163,9 +163,9 @@ pub struct GuildsComponentReplicatedState {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuildInviteStateData, GuildsComponentReplicatedState};
-    use crate::hub::FragmentTypeInfo;
-    use crate::serialize::{CARRIER_ENDIAN, ReadBuffer};
+    use super::{GuildInviteStateData, GuildInvites, GuildsComponentReplicatedState};
+    use crate::hub::{DynFragment, FragmentTypeInfo, SequenceNumber};
+    use crate::serialize::{CARRIER_ENDIAN, ChangeOp, IndexMap, ReadBuffer, WriteBuffer};
 
     /// A guild invite update in the layout live sends: group 1, field 22
     /// (`guildInvites`), a container snapshot with one entry. The values are
@@ -189,30 +189,118 @@ mod tests {
         0, 0, 0, 0, 0, 0, 0, 0x2a, // sent time
     ];
 
-    #[test]
-    fn guild_invites_are_a_container() {
-        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, GUILD_INVITE);
-        let fragment = FragmentTypeInfo::TypeIndex(3147)
-            .decode_contents(&mut rb)
-            .expect("guilds contents decode");
-        assert_eq!(rb.position(), GUILD_INVITE.len());
-        let state = fragment
-            .downcast_ref::<GuildsComponentReplicatedState>()
-            .expect("type index 3147 is GuildsComponentReplicatedState");
-        let key: [u8; 16] = std::array::from_fn(|i| 0x10 + i as u8);
-        let invite: GuildInviteStateData = state
-            .guild_invites
-            .clone()
-            .into_values()
-            .get(&key)
-            .cloned()
-            .expect("the invite is keyed by its id");
+    /// The same field as a container delta in the layout live sends: two
+    /// changes, the first live with an invite, the second a removal that
+    /// repeats the first one's sequence. The values are made up.
+    const GUILD_INVITE_DELTA: &[u8] = &[
+        0x02, // group 1 dirty
+        0x80, 0x80, 0x80, 0x02, // field 22 (guild invites), no more masks
+        0x02, // two changes
+        0x01, // live mask: the first carries a value, the second is a removal
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, //
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // key
+        0x01, 0x07, // sequence 7
+        0x03, b'A', b'B', b'C', // guild name
+        0x00, 0x07, // crest foreground id
+        0x3f, 0x80, 0, 0, 0x3f, 0x80, 0, 0, 0x3f, 0x80, 0, 0, 0x3f, 0x80, 0, 0, // colour
+        0x00, 0x09, // crest background id
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3f, 0x80, 0, 0, // colour
+        0x02, b'x', b'y', // sender name
+        0, 0, 0, 0x03, // sender rank
+        0x01, b'z', // sender display name
+        0, 0, 0, 0, 0, 0, 0, 0x2a, // sent time
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, //
+        0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, // key
+        0x01, 0x00, // repeat the previous sequence
+    ];
+
+    fn key(base: u8) -> [u8; 16] {
+        std::array::from_fn(|i| base + i as u8)
+    }
+
+    fn assert_is_the_test_invite(invite: &GuildInviteStateData) {
         assert_eq!(invite.guild_name, "ABC");
         assert_eq!(invite.guild_crest_data.foreground_id, 7);
+        assert_eq!(invite.guild_crest_data.foreground_color.rgba, [1.0; 4]);
         assert_eq!(invite.guild_crest_data.background_id, 9);
+        assert_eq!(
+            invite.guild_crest_data.background_color.rgba,
+            [0.0, 0.0, 0.0, 1.0]
+        );
         assert_eq!(invite.sender_name, "xy");
         assert_eq!(invite.sender_data.rank, 3);
         assert_eq!(invite.sender_data.display_name, "z");
         assert_eq!(invite.sent_time, 42);
+    }
+
+    fn decode(bytes: &[u8]) -> GuildsComponentReplicatedState {
+        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, bytes);
+        let fragment = FragmentTypeInfo::TypeIndex(3147)
+            .decode_contents(&mut rb)
+            .expect("guilds contents decode");
+        assert_eq!(rb.position(), bytes.len());
+        fragment
+            .downcast_ref::<GuildsComponentReplicatedState>()
+            .expect("type index 3147 is GuildsComponentReplicatedState")
+            .clone()
+    }
+
+    #[test]
+    fn guild_invites_are_a_container() {
+        let state = decode(GUILD_INVITE);
+        let invite = state
+            .guild_invites
+            .clone()
+            .into_values()
+            .get(&key(0x10))
+            .cloned()
+            .expect("the invite is keyed by its id");
+        assert_is_the_test_invite(&invite);
+    }
+
+    #[test]
+    fn guild_invite_deltas_carry_keys_sequences_and_live_values() {
+        let state = decode(GUILD_INVITE_DELTA);
+        let changes = state.guild_invites.current_changes();
+        assert_eq!(changes.len(), 2);
+
+        assert_eq!(changes[0].op(), ChangeOp::Update);
+        assert_eq!(changes[0].key(), &key(0x10));
+        assert_eq!(changes[0].sequence(), SequenceNumber::Seq(7));
+        assert_is_the_test_invite(changes[0].value().expect("a live change has a value"));
+
+        assert_eq!(changes[1].op(), ChangeOp::Remove);
+        assert_eq!(changes[1].key(), &key(0x20));
+        assert_eq!(changes[1].sequence(), SequenceNumber::Seq(7));
+        assert!(changes[1].value().is_none());
+    }
+
+    #[test]
+    fn guild_invites_snapshot_encodes_in_the_live_layout() {
+        let invite = decode(GUILD_INVITE)
+            .guild_invites
+            .into_values()
+            .swap_remove(&key(0x10))
+            .expect("the invite is keyed by its id");
+        let mut invites = IndexMap::new();
+        invites.insert(key(0x10), invite);
+        let state = GuildsComponentReplicatedState {
+            guild_invites: GuildInvites::new(5, invites),
+            ..Default::default()
+        };
+
+        let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+        assert!(DynFragment::marshal_contents(&state, &mut wb));
+        assert_eq!(wb.as_slice(), GUILD_INVITE);
+
+        let decoded = decode(wb.as_slice());
+        assert_is_the_test_invite(
+            decoded
+                .guild_invites
+                .clone()
+                .into_values()
+                .get(&key(0x10))
+                .expect("the invite survives the round trip"),
+        );
     }
 }

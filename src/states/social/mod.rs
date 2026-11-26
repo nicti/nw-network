@@ -20,7 +20,7 @@ pub use groups::{
 };
 pub use guilds::{
     EligibleTerritoryWar, GuildCrestColor, GuildCrestData, GuildInviteSenderData,
-    GuildInviteStateData, GuildPlayerIdentification, GuildsComponentReplicatedState,
+    GuildInviteStateData, GuildInvites, GuildPlayerIdentification, GuildsComponentReplicatedState,
     ReplicatedGuildInfluence,
 };
 pub use player_generic_invite::{
