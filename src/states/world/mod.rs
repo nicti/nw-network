@@ -1,6 +1,7 @@
 //! World-positioning, pathing, map, and metadata replicated state modules.
 
 pub mod client_pathing;
+pub mod dungeon_entrance;
 pub mod gde_metadata;
 pub mod global_map_data_manager;
 pub mod position_in_the_world;
@@ -12,6 +13,7 @@ pub use client_pathing::{
     MAX_CLIENT_PATHING_CORRIDOR_PATHS, MAX_CLIENT_PATHING_CORRIDOR_POINTS,
     MAX_CLIENT_PATHING_CORRIDOR_SAMPLES,
 };
+pub use dungeon_entrance::{DungeonEntranceReplicatedState, DungeonSpawned};
 pub use gde_metadata::GdeMetadataReplicatedState;
 pub use global_map_data_manager::{
     GlobalMapData, GlobalMapDataManagerComponentReplicatedState, GlobalMapDataMap,

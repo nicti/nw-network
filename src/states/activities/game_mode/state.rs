@@ -9,10 +9,17 @@
 //! state id (one byte) decoded as a four-byte `gameModeId`, and the rest of
 //! its bundle was read from the wrong offset.
 //!
-//! The game mode's own fields keep the generated shapes, except `values` and
-//! `syncedTimers`, which are the scripted timer maps of
-//! [`SyncedTimerMap`]: their handler reads a delta change's timer as a VLQ
-//! and a snapshot entry's timer as a fixed `u64`.
+//! The game mode's own fields keep the generated shapes, except:
+//!
+//! - `values` and `syncedTimers`, the scripted timer maps of
+//!   [`SyncedTimerMap`]: their handler reads a delta change's timer as a VLQ
+//!   and a snapshot entry's timer as a fixed `u64`.
+//! - `participantCharacterIds`, a replicated container of entity refs, like
+//!   the participant containers beside it (mode, sequence, count, then one
+//!   [`EntityRef`](crate::EntityRef) per entry). The schema gives it a
+//!   plain-field shape, `vec<composite<u8, vlq-u64, optional<vlq-u64>,
+//!   entity-ref>>`; read that way, a live snapshot's mode byte decoded as an
+//!   empty list and the rest of the state was read from the wrong offset.
 
 use crate::states::scripting::SyncedTimerMap;
 use crate::types::{Crc32, EntityId};
@@ -347,22 +354,6 @@ impl crate::serialize::Unmarshal for IconsValue {
         <IconsValueMarshaler as crate::serialize::Codec<IconsValue>>::unmarshal(rb)
     }
 }
-/// One participant: index, character id, optional VLQ id, entity.
-pub type ParticipantCharacterId = (u8, u64, Option<u64>, crate::EntityRef);
-
-/// `participantCharacterIds`, in its generated wire shape.
-pub type ParticipantCharacterIdsField = crate::serialize::ReplicatedFieldHandler<
-    Vec<ParticipantCharacterId>,
-    crate::serialize::SequenceCodec<
-        crate::serialize::TupleCodec<(
-            crate::serialize::DefaultMarshaler<u8>,
-            crate::serialize::DefaultMarshaler<u64>,
-            crate::serialize::OptionalCodec<crate::serialize::VlqU64Marshaler>,
-            crate::serialize::DefaultMarshaler<crate::EntityRef>,
-        )>,
-    >,
->;
-
 #[replicated_state]
 #[az_rtti("78EA6535-BB84-4D6A-A5A3-747AF2F5167C")]
 #[type_registry(2343u32)]
@@ -392,7 +383,12 @@ pub struct GameModeReplicatedState {
         crate::serialize::DefaultMarshaler<crate::serialize::VlqU64>,
         ParticipantTeamIndexesValueMarshaler,
     >,
-    pub participant_character_ids: ParticipantCharacterIdsField,
+    pub participant_character_ids: crate::serialize::ReplicatedContainer<
+        ::std::vec::Vec<crate::EntityRef>,
+        { crate::serialize::WIRE_VEC_CAP },
+        crate::serialize::DefaultMarshaler<crate::serialize::VlqU64>,
+        crate::serialize::DefaultMarshaler<crate::EntityRef>,
+    >,
     pub raid_ids: crate::serialize::ReplicatedContainer<
         ::std::vec::Vec<RaidId>,
         { crate::serialize::WIRE_VEC_CAP },
@@ -476,6 +472,25 @@ mod tests {
         0x05, // timer 5, VLQ
     ];
 
+    /// A participant snapshot in the layout live sends: the character ids
+    /// as a container of entity refs, then the raid ids after them. The
+    /// values are made up.
+    const PARTICIPANT_CHARACTER_IDS_SNAPSHOT: &[u8] = &[
+        0x01, // group 0 dirty
+        0x80, // no field of 0..=6, more masks follow
+        0x06, // fields 8 (participantCharacterIds) and 9 (raidIds)
+        0x00, // participantCharacterIds: snapshot
+        0x01, 0x04, // last-modified sequence 4
+        0x01, // one entry
+        0x05, // entity ref: a UUID, format flags 2
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, //
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // UUID
+        0x00, // raidIds: snapshot
+        0x01, 0x04, // last-modified sequence 4
+        0x01, // one entry
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // raid id
+    ];
+
     /// Decodes through the type-index registry, as a bundle walk does, and
     /// returns the state and the bytes consumed.
     fn decode(bytes: &[u8]) -> (GameModeReplicatedState, usize) {
@@ -514,5 +529,21 @@ mod tests {
         assert_eq!(changes[0].value(), Some(&VlqU64::new(251)));
         assert_eq!(changes[1].key(), &Crc32::new(0x0102_0304));
         assert_eq!(changes[1].value(), Some(&VlqU64::new(5)));
+    }
+
+    #[test]
+    fn participant_character_ids_are_a_container_of_entity_refs() {
+        let (state, consumed) = decode(PARTICIPANT_CHARACTER_IDS_SNAPSHOT);
+        assert_eq!(consumed, PARTICIPANT_CHARACTER_IDS_SNAPSHOT.len());
+        let uuid = uuid::Uuid::from_bytes([
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ]);
+        assert_eq!(
+            state.participant_character_ids.values(),
+            &vec![crate::EntityRef::uuid(uuid, 2)]
+        );
+        assert_eq!(state.raid_ids.values().len(), 1);
+        assert_eq!(state.raid_ids.values()[0].field_0, 0x0102_0304_0506_0708);
     }
 }

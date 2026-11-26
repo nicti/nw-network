@@ -12,6 +12,7 @@ pub mod reaction_tracking;
 pub mod spell;
 pub mod stat_multiplier_table;
 pub mod status_effect;
+pub mod turret;
 pub mod vitals;
 
 pub use crate::generated::states::{
@@ -45,6 +46,7 @@ pub use status_effect::{
     RemoteStatusEffectData, StatusEffectInstanceData, StatusEffectsComponentReplicatedState,
     StatusEffectsSnapshot, TerritoryStatusEffect,
 };
+pub use turret::TurretReplicatedState;
 pub use vitals::{
     ColdAfflictionData, HotAfflictionData, VitalsComponentReplicatedState, VitalsStateData,
 };
