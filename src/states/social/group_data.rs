@@ -6,8 +6,15 @@
 //! `AZ::Vector3` layout and emitted four halves (8 bytes), as it did for the
 //! projectile's `spawnVelocity` (type 16). A live group update carrying raid
 //! member positions decoded 2 bytes long per position, so the rest of the
-//! fragment and of its bundle was read from the wrong offset. The other
-//! fields keep the generated shapes and order.
+//! fragment and of its bundle was read from the wrong offset.
+//!
+//! And `groupMemberGameModeIndex` (five fields): the generated shape is a
+//! `bool` and a `u8` (2 bytes), but the client reads the `u8` only when the
+//! flag is set (6004151, `0x1433f5260`). A member with no game mode is one
+//! byte on the wire; read as two, every later field was read a byte off and
+//! the rest of the bundle was lost.
+//!
+//! The other fields keep the generated shapes and order.
 
 use ::nw_network::{az_rtti, replicated_state, type_registry};
 
@@ -25,22 +32,24 @@ pub type GroupMemberBaseData = (
     u8,
     u16,
 );
+/// Value of each `groupMemberGameModeIndex` field: an optional game mode
+/// index. `field_0` says whether it is set; `field_1` is the index, on the
+/// wire only when set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GroupMemberGameModeIndexValue {
     pub field_0: bool,
     pub field_1: u8,
 }
+/// The schema gives this field the generated shape `bool, u8` (2 bytes), but
+/// the client's unmarshaler (6004151, `0x1433f5260`) reads the `u8` only when
+/// the flag is set, like an optional: live sends `00` for a member with no
+/// game mode and `01 xx` for one with. Variable size.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GroupMemberGameModeIndexValueMarshaler;
 impl ::nw_network::serialize::Codec<GroupMemberGameModeIndexValue>
     for GroupMemberGameModeIndexValueMarshaler
 {
-    const MARSHAL_SIZE: usize = <::nw_network::serialize::DefaultMarshaler<
-        bool,
-    > as ::nw_network::serialize::Codec<bool>>::MARSHAL_SIZE
-        + <::nw_network::serialize::DefaultMarshaler<
-            u8,
-        > as ::nw_network::serialize::Codec<u8>>::MARSHAL_SIZE;
+    const MARSHAL_SIZE: usize = 0;
     fn marshal(
         value: &GroupMemberGameModeIndexValue,
         wb: &mut ::nw_network::serialize::WriteBuffer,
@@ -48,9 +57,11 @@ impl ::nw_network::serialize::Codec<GroupMemberGameModeIndexValue>
         <::nw_network::serialize::DefaultMarshaler<
             bool,
         > as ::nw_network::serialize::Codec<bool>>::marshal(&value.field_0, wb);
-        <::nw_network::serialize::DefaultMarshaler<
-            u8,
-        > as ::nw_network::serialize::Codec<u8>>::marshal(&value.field_1, wb);
+        if value.field_0 {
+            <::nw_network::serialize::DefaultMarshaler<
+                u8,
+            > as ::nw_network::serialize::Codec<u8>>::marshal(&value.field_1, wb);
+        }
     }
     fn unmarshal(
         rb: &mut ::nw_network::serialize::ReadBuffer,
@@ -59,10 +70,13 @@ impl ::nw_network::serialize::Codec<GroupMemberGameModeIndexValue>
             <::nw_network::serialize::DefaultMarshaler<bool> as ::nw_network::serialize::Codec<
                 bool,
             >>::unmarshal(rb)?;
-        let field_field_1 =
+        let field_field_1 = if field_field_0 {
             <::nw_network::serialize::DefaultMarshaler<u8> as ::nw_network::serialize::Codec<
                 u8,
-            >>::unmarshal(rb)?;
+            >>::unmarshal(rb)?
+        } else {
+            0
+        };
         Ok(GroupMemberGameModeIndexValue {
             field_0: field_field_0,
             field_1: field_field_1,
@@ -743,7 +757,10 @@ pub struct GroupDataComponentReplicatedState {
 mod tests {
     use glam::Vec3;
 
-    use super::GroupDataComponentReplicatedState;
+    use super::{
+        GroupDataComponentReplicatedState, GroupMemberGameModeIndexValue,
+        GroupMemberGameModeIndexValueMarshaler,
+    };
     use crate::hub::FragmentTypeInfo;
     use crate::serialize::{CARRIER_ENDIAN, ReadBuffer};
 
@@ -784,5 +801,79 @@ mod tests {
         );
         assert_eq!(state.raid_member_position_75.value(), None);
         assert_eq!(state.join_queue_throttle_active.value(), Some(&true));
+    }
+
+    /// A member update for group 1 in the layout live sends: the game mode
+    /// index flag, its value only when set, then the faction. The values are
+    /// made up.
+    fn member_update(game_mode: &[u8]) -> Vec<u8> {
+        let mut body = vec![
+            0x02, // group 1 dirty
+            0x0c, // fields 2 and 3 (game mode index, faction), no more masks
+        ];
+        body.extend_from_slice(game_mode);
+        body.push(0x05); // faction
+        body
+    }
+
+    fn decode(body: &[u8]) -> (usize, GroupMemberGameModeIndexValue, u8) {
+        let mut rb = ReadBuffer::new(CARRIER_ENDIAN, body);
+        let fragment = FragmentTypeInfo::TypeIndex(3451)
+            .decode_contents(&mut rb)
+            .expect("group data contents decode");
+        let state = fragment
+            .downcast_ref::<GroupDataComponentReplicatedState>()
+            .expect("type index 3451 is GroupDataComponentReplicatedState");
+        (
+            rb.position(),
+            state
+                .group_member_game_mode_index
+                .value()
+                .cloned()
+                .expect("game mode index set"),
+            *state.group_member_faction.value().expect("faction set"),
+        )
+    }
+
+    #[test]
+    fn an_unset_game_mode_index_is_one_byte() {
+        let body = member_update(&[0x00]);
+        let (read, index, faction) = decode(&body);
+        assert_eq!(read, body.len());
+        assert_eq!(index, GroupMemberGameModeIndexValue::default());
+        assert_eq!(faction, 5);
+    }
+
+    #[test]
+    fn a_set_game_mode_index_carries_its_value() {
+        let body = member_update(&[0x01, 0x22]);
+        let (read, index, faction) = decode(&body);
+        assert_eq!(read, body.len());
+        assert_eq!(
+            index,
+            GroupMemberGameModeIndexValue {
+                field_0: true,
+                field_1: 0x22,
+            }
+        );
+        assert_eq!(faction, 5);
+    }
+
+    #[test]
+    fn the_game_mode_index_writes_its_value_only_when_set() {
+        use crate::serialize::{Codec, WriteBuffer};
+        let write = |value: &GroupMemberGameModeIndexValue| {
+            let mut wb = WriteBuffer::new(CARRIER_ENDIAN);
+            GroupMemberGameModeIndexValueMarshaler::marshal(value, &mut wb);
+            wb.into_vec()
+        };
+        assert_eq!(write(&GroupMemberGameModeIndexValue::default()), [0x00]);
+        assert_eq!(
+            write(&GroupMemberGameModeIndexValue {
+                field_0: true,
+                field_1: 0x22,
+            }),
+            [0x01, 0x22]
+        );
     }
 }

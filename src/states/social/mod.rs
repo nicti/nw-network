@@ -24,7 +24,8 @@ pub use guilds::{
     ReplicatedGuildInfluence,
 };
 pub use player_generic_invite::{
-    PlayerGenericInviteParticipants, PlayerGenericInviteReplicatedState,
+    GenericInviteParticipantState, PlayerGenericInviteParticipants,
+    PlayerGenericInviteReplicatedState,
 };
 pub use state::{SocialCollectionsSnapshot, SocialReplicatedState};
 pub use temporary_affiliation::{

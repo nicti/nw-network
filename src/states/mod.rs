@@ -140,12 +140,14 @@ pub use spawning::{
     VariationComponentReplicatedState,
 };
 pub use territory::{
-    FactionComponentReplicatedState, InfluenceRaceData, LandClaimComponentReplicatedState,
-    LandClaimGovernanceData, LandClaimManagerComponentReplicatedState, LandClaimOwnerData,
-    LandClaimProgressionData, LandClaimProgressionPair, LandClaimProgressionTriple,
-    LandClaimSnapshot, WarDataAssetReference, WarDataComponentReplicatedState, WarDataDetailBlock,
-    WarDataParticipantBlock, WarDataSnapshot, WarDataUuidList, WarDataValue,
-    WarScheduleAdjustmentReplicatedState,
+    CapturePointColdData, FactionComponentReplicatedState, InfluenceRaceData,
+    LandClaimComponentReplicatedState, LandClaimGovernanceData,
+    LandClaimManagerComponentReplicatedState, LandClaimOwnerData, LandClaimProgressionData,
+    LandClaimProgressionPair, LandClaimProgressionTriple, LandClaimSnapshot,
+    SiegeWarfareDataReplicatedState, TerritoryGovernanceData, TerritoryGovernanceTriple,
+    TerritoryInterfaceComponentReplicatedState, WarDataAssetReference,
+    WarDataComponentReplicatedState, WarDataDetailBlock, WarDataParticipantBlock, WarDataSnapshot,
+    WarDataUuidList, WarDataValue, WarScheduleAdjustmentReplicatedState,
 };
 pub use world::{
     AlignToTerrainComponentReplicatedState, ClientPathingComponentReplicatedState,

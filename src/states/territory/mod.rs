@@ -2,6 +2,8 @@
 
 pub mod faction;
 pub mod land_claim_manager;
+pub mod siege_warfare;
+pub mod territory_interface;
 pub mod war_data;
 
 pub use crate::generated::states::LandClaimComponentReplicatedState;
@@ -10,6 +12,10 @@ pub use land_claim_manager::{
     LandClaimGovernanceData, LandClaimManagerComponentReplicatedState, LandClaimOwnerData,
     LandClaimProgressionData, LandClaimProgressionPair, LandClaimProgressionTriple,
     LandClaimSnapshot,
+};
+pub use siege_warfare::{CapturePointColdData, SiegeWarfareDataReplicatedState};
+pub use territory_interface::{
+    TerritoryGovernanceData, TerritoryGovernanceTriple, TerritoryInterfaceComponentReplicatedState,
 };
 pub use war_data::{
     InfluenceRaceData, WarDataAssetReference, WarDataComponentReplicatedState, WarDataDetailBlock,
