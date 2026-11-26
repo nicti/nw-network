@@ -149,8 +149,9 @@ pub use territory::{
 };
 pub use world::{
     AlignToTerrainComponentReplicatedState, ClientPathingComponentReplicatedState,
-    ClientPathingCorridorPath, ClientPathingCorridorPaths, GdeMetadataReplicatedState,
-    GlobalMapData, GlobalMapDataManagerComponentReplicatedState, GlobalMapDataMap,
+    ClientPathingCorridorPath, ClientPathingCorridorPaths, DungeonEntranceReplicatedState,
+    DungeonSpawned, GdeMetadataReplicatedState, GlobalMapData,
+    GlobalMapDataManagerComponentReplicatedState, GlobalMapDataMap,
     MAX_CLIENT_PATHING_CORRIDOR_PATHS, MAX_CLIENT_PATHING_CORRIDOR_POINTS,
     MAX_CLIENT_PATHING_CORRIDOR_SAMPLES, PositionInTheWorldReplicatedState,
     WaypointsComponentReplicatedState, position_anchor_to_bevy_translation,
