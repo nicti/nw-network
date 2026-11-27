@@ -126,7 +126,7 @@ pub use social::{
     ChatMuteEntry, ChatMutes, ChatReplicatedState, EligibleTerritoryWar, GameInviteData,
     GroupDataComponentReplicatedState, GroupFinderApplicationData, GroupInviteData,
     GroupMemberHouseId, GroupsComponentReplicatedState, GuildCrestColor, GuildCrestData,
-    GuildInviteSenderData, GuildInviteStateData, GuildPlayerIdentification,
+    GuildInviteSenderData, GuildInviteStateData, GuildInvites, GuildPlayerIdentification,
     GuildsComponentReplicatedState, MAX_TEMPORARY_AFFILIATION_CHANGES,
     MagicComponentReplicatedState, OwnershipComponentReplicatedState,
     PlayerGenericInviteParticipants, PlayerGenericInviteReplicatedState, ReplicatedGuildInfluence,
