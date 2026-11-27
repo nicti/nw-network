@@ -65,7 +65,12 @@ fn main() -> Result<()> {
         &message_signatures_file,
     )?;
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").context("OUT_DIR")?);
-    let output_root = stable_generated_root(&out_dir, "nw-network")?;
+    // One directory per input hash: builds of different inputs (for example
+    // two nw-network pins in one target dir) never share or rewrite a file,
+    // so hard links into other OUT_DIRs keep their own content.
+    let output_root = stable_generated_root(&out_dir, "nw-network")?.join(&input_hash[..16]);
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create generated root {}", output_root.display()))?;
     // Rust-analyzer only tracks generated sources under Cargo's actual OUT_DIR.
     let include_root = out_dir.join("nw-network-generated");
     let stamp_path = output_root.join(".generated-states-input-hash");
