@@ -119,7 +119,7 @@ impl Unmarshal for ChatMutes {
                     capacity: WIRE_VEC_CAP,
                 });
             }
-            let mut trailing_strings = Vec::with_capacity(string_count);
+            let mut trailing_strings = Vec::with_capacity(rb.reserve_hint(string_count));
             for _ in 0..string_count {
                 trailing_strings.push(String::unmarshal(rb)?);
             }
@@ -131,7 +131,7 @@ impl Unmarshal for ChatMutes {
             });
         }
 
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(rb.reserve_hint(count));
         let mut previous_sequence = SequenceNumber::Invalid;
         while count > 0 {
             let bitmask = u8::unmarshal(rb)?;

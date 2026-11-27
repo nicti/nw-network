@@ -51,7 +51,7 @@ impl Marshal for ActorInstantiationParameters {
 impl Unmarshal for ActorInstantiationParameters {
     fn unmarshal(rb: &mut ReadBuffer<'_>) -> Result<Self, MarshalerError> {
         let count = usize::from(u16::unmarshal(rb)?);
-        let mut values = IndexMap::with_capacity(count);
+        let mut values = IndexMap::with_capacity(rb.reserve_hint(count));
         for _ in 0..count {
             if !bool::unmarshal(rb)? {
                 return Err(MarshalerError::NullPolymorphicValue);

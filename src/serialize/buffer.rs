@@ -180,6 +180,17 @@ impl<'a> ReadBuffer<'a> {
         &self.data[self.position..]
     }
 
+    /// Capacity to reserve for `count` entries announced by the wire.
+    ///
+    /// The count comes from untrusted input, so it is clamped to the number
+    /// of unread bytes: a malformed count then cannot reserve more than the
+    /// buffer could plausibly fill. This is a hint only; containers still
+    /// grow on demand, so valid input decodes identically.
+    #[must_use]
+    pub fn reserve_hint(&self, count: usize) -> usize {
+        count.min(self.remaining().len())
+    }
+
     /// Bytes in an already-observed absolute range.
     ///
     /// # Errors

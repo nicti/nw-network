@@ -67,7 +67,7 @@ impl<T, M: Codec<T>> Codec<Vec<T>> for SequenceCodec<M> {
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<Vec<T>, MarshalerError> {
         let len = unmarshal_wire_count(rb, WIRE_VEC_CAP)?;
-        let mut value = Vec::with_capacity(len);
+        let mut value = Vec::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             value.push(M::unmarshal(rb)?);
         }
@@ -113,7 +113,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<IndexMap<K, V>, MarshalerError> {
         let len = unmarshal_wire_count(rb, WIRE_VEC_CAP)?;
-        let mut value = IndexMap::with_capacity(len);
+        let mut value = IndexMap::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             value.insert(KM::unmarshal(rb)?, VM::unmarshal(rb)?);
         }
@@ -184,7 +184,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<Vec<T>, MarshalerError> {
         let len = Self::unmarshal_len(rb)?;
-        let mut value = Vec::with_capacity(len);
+        let mut value = Vec::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             value.push(M::unmarshal(rb)?);
         }
@@ -265,7 +265,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<IndexSet<T>, MarshalerError> {
         let len = Self::unmarshal_len(rb)?;
-        let mut value = IndexSet::with_capacity(len);
+        let mut value = IndexSet::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             value.insert(M::unmarshal(rb)?);
         }
@@ -288,7 +288,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<HashSet<T, S>, MarshalerError> {
         let len = Self::unmarshal_len(rb)?;
-        let mut value = HashSet::with_capacity_and_hasher(len, S::default());
+        let mut value = HashSet::with_capacity_and_hasher(rb.reserve_hint(len), S::default());
         for _ in 0..len {
             value.insert(M::unmarshal(rb)?);
         }
@@ -388,7 +388,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<HashMap<K, V, S>, MarshalerError> {
         let len = Self::unmarshal_len(rb)?;
-        let mut value = HashMap::with_capacity_and_hasher(len, S::default());
+        let mut value = HashMap::with_capacity_and_hasher(rb.reserve_hint(len), S::default());
         for _ in 0..len {
             let key = KM::unmarshal(rb)?;
             let item = VM::unmarshal(rb)?;
@@ -440,7 +440,7 @@ where
 
     fn unmarshal(rb: &mut ReadBuffer) -> Result<IndexMap<K, V>, MarshalerError> {
         let len = Self::unmarshal_len(rb)?;
-        let mut value = IndexMap::with_capacity(len);
+        let mut value = IndexMap::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             let key = KM::unmarshal(rb)?;
             let item = VM::unmarshal(rb)?;
@@ -466,7 +466,7 @@ impl<T: Marshal> Marshal for Vec<T> {
 impl<T: Unmarshal> Unmarshal for Vec<T> {
     fn unmarshal(rb: &mut ReadBuffer) -> Result<Self, MarshalerError> {
         let len = unmarshal_wire_count(rb, WIRE_VEC_CAP)?;
-        let mut v = Vec::with_capacity(len);
+        let mut v = Vec::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             v.push(T::unmarshal(rb)?);
         }
@@ -601,7 +601,7 @@ where
                 capacity: WIRE_VEC_CAP,
             });
         }
-        let mut set = IndexSet::with_capacity(len);
+        let mut set = IndexSet::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             set.insert(T::unmarshal(rb)?);
         }
@@ -639,7 +639,7 @@ where
                 capacity: WIRE_VEC_CAP,
             });
         }
-        let mut map = IndexMap::with_capacity(len);
+        let mut map = IndexMap::with_capacity(rb.reserve_hint(len));
         for _ in 0..len {
             let k = K::unmarshal(rb)?;
             let v = V::unmarshal(rb)?;
@@ -680,7 +680,7 @@ where
                 capacity: WIRE_VEC_CAP,
             });
         }
-        let mut set = HashSet::with_capacity_and_hasher(len, S::default());
+        let mut set = HashSet::with_capacity_and_hasher(rb.reserve_hint(len), S::default());
         for _ in 0..len {
             set.insert(T::unmarshal(rb)?);
         }
@@ -755,7 +755,7 @@ where
                 capacity: WIRE_VEC_CAP,
             });
         }
-        let mut map = HashMap::with_capacity_and_hasher(len, S::default());
+        let mut map = HashMap::with_capacity_and_hasher(rb.reserve_hint(len), S::default());
         for _ in 0..len {
             let k = K::unmarshal(rb)?;
             let v = V::unmarshal(rb)?;

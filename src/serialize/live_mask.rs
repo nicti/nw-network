@@ -20,9 +20,9 @@ use super::{
 ///
 /// `f` is called with the buffer and a `live: bool` from the chunk's mask
 /// — typically "this slot's optional value is present on the wire." The
-/// closure returns the constructed entry; allocate-once via the
-/// preallocated `Vec` (`Vec::with_capacity(total)`) avoids reallocation
-/// during the read.
+/// closure returns the constructed entry; the `Vec` reserves at most
+/// the unread byte count (see `ReadBuffer::reserve_hint`), so a malformed
+/// `total` cannot force a huge up-front allocation.
 ///
 /// # Errors
 ///
@@ -35,7 +35,7 @@ pub fn read_live_mask_batches<T, F>(
 where
     F: FnMut(&mut ReadBuffer, bool) -> Result<T, MarshalerError>,
 {
-    let mut out = Vec::with_capacity(total);
+    let mut out = Vec::with_capacity(rb.reserve_hint(total));
     let mut remaining = total;
     while remaining > 0 {
         let mask = rb.read_u8()?;
