@@ -8,15 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::{IndexMap, IndexSet};
-use nw_network::hub::SequenceNumber;
+use nw_network::hub::{ActorInstantiationParameters, SequenceNumber};
 use nw_network::serialize::{
     CARRIER_ENDIAN, Codec, ContainerMarshaler, DefaultMarshaler, MapContainerMarshaler,
     MapSequenceCodec, Marshal, MarshalerError, ReadBuffer, ReplicatedContainer, SequenceCodec,
     Unmarshal, VlqU32Marshaler, WIRE_VEC_CAP, WriteBuffer, read_live_mask_batches,
 };
+use nw_network::states::social::ChatMutes;
 
 struct Counting;
 
+// One process-wide high-water mark: `check` resets and reads it, so this file
+// must keep a single #[test] (parallel tests would pollute each other's reading).
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
@@ -125,5 +128,37 @@ fn huge_count_with_tiny_buffer_reserves_nothing_large() {
     check(&mut failures, "replicated delta", &delta, |rb| {
         ReplicatedContainer::<Vec<u64>>::unmarshal(rb)
     });
+    check(
+        &mut failures,
+        "chat mutes snapshot strings",
+        &snapshot,
+        ChatMutes::unmarshal,
+    );
+    check(
+        &mut failures,
+        "chat mutes delta entries",
+        &delta,
+        ChatMutes::unmarshal,
+    );
+    check(
+        &mut failures,
+        "actor instantiation parameters",
+        &bytes(|wb| 0xFFFFu16.marshal(wb)),
+        ActorInstantiationParameters::unmarshal,
+    );
+    // Some entry bytes follow the count: the hint is then min(count, 16),
+    // not 0, and the decode still fails once the entries run out.
+    let some = bytes(|wb| {
+        vlq(wb, cap);
+        for _ in 0..16 {
+            0u8.marshal(wb);
+        }
+    });
+    check(
+        &mut failures,
+        "sequence codec Vec<u64> with 16 entry bytes",
+        &some,
+        <SequenceCodec<DefaultMarshaler<u64>> as Codec<Vec<u64>>>::unmarshal,
+    );
     assert!(failures.is_empty(), "{failures:#?}");
 }
