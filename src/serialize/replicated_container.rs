@@ -849,7 +849,7 @@ impl<T> ReplicatedContainerStorage for Vec<T> {
         KM: Codec<Self::Key>,
         VM: Codec<Self::Value>,
     {
-        let mut values = Vec::with_capacity(count);
+        let mut values = Vec::with_capacity(rb.reserve_hint(count));
         for _ in 0..count {
             values.push(VM::unmarshal_snapshot(rb)?);
         }
@@ -947,7 +947,7 @@ where
         KM: Codec<Self::Key>,
         VM: Codec<Self::Value>,
     {
-        let mut values = HashMap::with_capacity_and_hasher(count, S::default());
+        let mut values = HashMap::with_capacity_and_hasher(rb.reserve_hint(count), S::default());
         for _ in 0..count {
             values.insert(KM::unmarshal(rb)?, VM::unmarshal_snapshot(rb)?);
         }
@@ -1025,7 +1025,7 @@ where
         KM: Codec<Self::Key>,
         VM: Codec<Self::Value>,
     {
-        let mut values = IndexMap::with_capacity(count);
+        let mut values = IndexMap::with_capacity(rb.reserve_hint(count));
         for _ in 0..count {
             values.insert(KM::unmarshal(rb)?, VM::unmarshal_snapshot(rb)?);
         }
